@@ -1,0 +1,30 @@
+[package]
+name = "shardheap"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+description = "Shared-nothing allocators for Rust's stable Allocator API: a mimalloc-style heap plus arenas and reaps that share its memory"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dahankzter/shardheap"
+readme = "README.md"
+keywords = ["allocator", "arena", "heap", "thread-per-core", "mimalloc"]
+categories = ["memory-management", "data-structures"]
+exclude = ["/target*", "/.github"]
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.8"
+mimalloc = { version = "0.1", default-features = false }
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+bumpalo = { version = "3", features = ["allocator-api2"] }
+allocator-api2 = { version = "0.2", default-features = false }
+
+[[bench]]
+name = "alloc"
+harness = false
+
+[profile.bench]
+codegen-units = 1
+debug = true
