@@ -16,7 +16,7 @@ use std::ptr::NonNull;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use shardheap::{Arena, LocalHeap};
+use shardheap::{Arena, LocalHeap, ShardAlloc};
 
 // ---- competitors ------------------------------------------------------------------
 
@@ -254,6 +254,12 @@ macro_rules! bench_all {
             let heap = LocalHeap::new();
             let $a = &heap;
             g.bench_function(BenchmarkId::from_parameter("shardheap"), |b| {
+                b.iter(|| $body)
+            });
+        }
+        {
+            let $a = &ShardAlloc::new();
+            g.bench_function(BenchmarkId::from_parameter("shard_alloc"), |b| {
                 b.iter(|| $body)
             });
         }

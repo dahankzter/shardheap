@@ -1,3 +1,4 @@
 /target
 /target-bench
 /target-miri
+/target-bench-aligned

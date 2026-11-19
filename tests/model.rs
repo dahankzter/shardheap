@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
-use shardheap::{Arena, HugePages, LocalHeap, StackArena};
+use shardheap::{Arena, HugePages, LocalHeap, ShardAlloc, StackArena};
 
 fn rng(mut s: u64) -> impl FnMut() -> u64 {
     move || {
@@ -478,4 +478,96 @@ fn maintain_purges_idle_memory() {
         // SAFETY: allocated above with `l`.
         unsafe { heap.deallocate(b, l) };
     }
+}
+
+// ---- ShardAlloc (each #[test] runs on its own thread, so its heap is its own) ----
+
+#[test]
+fn shard_alloc_model() {
+    run_model(&ShardAlloc::new(), 31);
+    run_model_with(&ShardAlloc::new(), 37, OPS / 4, true);
+    assert_eq!(ShardAlloc::stats().allocated_bytes, 0);
+}
+
+#[test]
+fn shard_alloc_zero_sized_and_zeroed() {
+    let a = ShardAlloc::new();
+    let z = Layout::from_size_align(0, 64).unwrap();
+    let p = a.allocate(z).unwrap().cast::<u8>();
+    // SAFETY: allocated above with `z`; must not read any header.
+    unsafe { a.deallocate(p, z) };
+    let l = Layout::new::<[u8; 3000]>();
+    let p = a.allocate(l).unwrap().cast::<u8>();
+    fill(p, l.size(), 0xff);
+    // SAFETY: allocated above with `l`.
+    unsafe { a.deallocate(p, l) };
+    let q = a.allocate_zeroed(l).unwrap().cast::<u8>();
+    check(q, l.size(), 0);
+    // SAFETY: allocated above with `l`.
+    unsafe { a.deallocate(q, l) };
+}
+
+#[test]
+fn shard_alloc_large_aligned_and_resized() {
+    let a = ShardAlloc::new();
+    let mut v: Vec<u8, ShardAlloc> = Vec::new_in(a);
+    // Past the largest small class (128 KiB), so growth takes the large path.
+    let n = if cfg!(miri) { 300_000 } else { 3 << 20 };
+    for i in 0..n {
+        v.push(i as u8); // small to large through `grow`
+    }
+    v.truncate(100);
+    v.shrink_to_fit(); // large to small through `shrink`
+    assert!(v.iter().enumerate().all(|(i, &b)| b == i as u8));
+    drop(v);
+    let l = Layout::from_size_align(300_000, 1 << 16).unwrap();
+    let p = a.allocate(l).unwrap().cast::<u8>();
+    assert_eq!(p.addr().get() % (1 << 16), 0);
+    // SAFETY: allocated above with `l`.
+    unsafe { a.deallocate(p, l) };
+    assert_eq!(ShardAlloc::stats().allocated_bytes, 0);
+}
+
+#[test]
+fn shard_alloc_threads_have_their_own_heaps() {
+    let other = std::thread::spawn(|| {
+        let b = Box::new_in([1u8; 4000], ShardAlloc::new());
+        let s = ShardAlloc::stats().allocated_bytes;
+        drop(b);
+        s
+    })
+    .join()
+    .unwrap();
+    let mine = ShardAlloc::stats().allocated_bytes;
+    let b = Box::new_in([2u8; 100], ShardAlloc::new());
+    assert!(other >= 4000);
+    assert_eq!(ShardAlloc::stats().allocated_bytes - mine, 112); // the 112 B class
+    drop(b);
+}
+
+struct LateUser(std::cell::RefCell<Option<Vec<u8, ShardAlloc>>>);
+
+impl Drop for LateUser {
+    fn drop(&mut self) {
+        drop(self.0.borrow_mut().take()); // a free after the heap's exit guard
+        let mut v = Vec::with_capacity_in(64, ShardAlloc::new()); // an allocation after it
+        v.extend_from_slice(b"late");
+        assert_eq!(&v[..], b"late");
+    }
+}
+
+thread_local!(static LATE: LateUser = const { LateUser(std::cell::RefCell::new(None)) });
+
+#[test]
+fn shard_alloc_survives_thread_teardown() {
+    std::thread::spawn(|| {
+        // Registered before the heap's exit guard, so (on Linux, where thread-local
+        // destructors run in reverse order of registration) destroyed after it.
+        LATE.with(|_| ());
+        let mut v = Vec::with_capacity_in(4096, ShardAlloc::new());
+        v.resize(4096, 9u8);
+        LATE.with(|l| *l.0.borrow_mut() = Some(v));
+    })
+    .join()
+    .unwrap();
 }

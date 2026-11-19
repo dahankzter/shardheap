@@ -243,6 +243,80 @@ builds that differ only in unrelated code. With
 `-C llvm-args=-align-loops=64`, both run at 247 µs: the swing is the alignment
 of the benchmark's push loop, not the heap.
 
+## Thread heaps (`ShardAlloc`)
+
+`ShardAlloc` is a zero-sized allocator value meaning "the current thread's
+heap". It is what a global allocator is, in `Allocator` form; phase 4 puts it
+behind `GlobalAlloc`.
+
+- **Records.** Each thread's heap lives in a *record*: heap state at an
+  address that never changes, mapped through `os.rs` (not the global allocator,
+  which shardheap will become in phase 4) and never freed. Records are pushed
+  onto a static list, so they stay reachable (Miri's leak check) and stage B
+  can walk them.
+- **Lookup.** A const `thread_local!` `Cell` holds the current record: one
+  thread-local load, with a null check whose out-of-line branch makes the
+  record on first use.
+- **Owner stamps.** Every segment header, page descriptor and large-mapping
+  header holds the address of its owning heap (0 for explicit heaps); a
+  record's heap is its first field, so that is the record's address and the
+  thread-local's value. `ShardAlloc`'s free computes the class from the
+  `Layout` once, reads the stamp (the page descriptor for small blocks,
+  `p - large_offset(align)` for large ones) and compares it with the
+  thread-local value, before touching the heap: a thread with no record (null)
+  never matches. A mismatch aborts: in stage A, `ShardAlloc` is `!Send`, so
+  only misused unsafe code can get there. Stage B turns that branch into
+  batching to the owner. `LocalHeap` keeps its unchecked free.
+- **Exit.** A destructor registered on first use trims the record when the
+  thread exits: a heap with no live blocks ends with nothing mapped, one with
+  live blocks keeps them. The record stays the thread's, so other thread-locals'
+  destructors that run later can still allocate and free through it; it is
+  marked exited, and the free that leaves it empty trims it.
+
+- **Empty heap.** Before its first allocation, a thread's `CURRENT` points
+  at a static, read-only empty heap whose queues are all null (mimalloc's
+  trick). Allocation needs no null check: the empty heap's fast path finds no
+  page and falls into the slow path, which makes the record. No block is
+  stamped with its address, so a free through it fails the owner check. It is
+  only ever read, through raw pointers (`Inner::alloc_fast`), never borrowed
+  `&mut`, so sharing it between threads is sound. A miss on a real heap goes
+  straight to its slow path (`Inner::alloc_miss`), without repeating the fast
+  path.
+
+### Results on one thread
+
+Same benchmarks as the README, loop-aligned build, medians in µs, three
+interleaved rounds per allocator in one binary:
+
+| | mimalloc | `&LocalHeap` | `ShardAlloc` |
+|---|---|---|---|
+| `lifo_64B` | 24.5-25.5 | 23.5-23.7 | 25.2 |
+| `batch_mixed` | 117-121 | 62.9-63.8 | 85.3-86.4 |
+| `vec_growth_8MiB` | 318-323 | 248-249 | 248-250 |
+| `tree_32k_nodes` | 248-251 | 225-229 | 228-232 |
+
+`ShardAlloc` ties mimalloc on `lifo_64B` (inside mimalloc's run-to-run
+spread) and beats it on the other three. What it pays over `&LocalHeap` on
+`lifo_64B`, about 0.15 ns per allocate/free pair, is the two thread-local loads
+and the owner compare: the floor of the design. How it got there, `lifo_64B`:
+
+| step | µs |
+|---|---|
+| first version | 29.0 |
+| owner read moved from the segment header to the page descriptor | 29.1 |
+| record moved off the page start (`RECORD_OFFSET`) | 27.4 |
+| empty heap instead of a null check | 25.2 |
+
+The first two steps removed false 4K aliases: each put a load at the same low
+12 address bits as the previous iteration's stores to the hot block, which sits
+at the start of its page, and stalled it behind them. The owner stamp at
+offset 0x38 of the segment header doubled store-to-load interlock stalls (322M
+to 613M); the page-aligned record put the class queue heads in the first bytes
+of a page (2.5G stalls, 6.6M after the move). The empty heap removed the last
+branch: the loop runs at about 5.9 instructions per cycle, so every instruction
+shows. Freeing through a page pointer computed once was slower (26.5) and was
+dropped.
+
 ## What Rust allows that C does not
 
 - **The size comes with every free.** The class, and the small/large decision,
@@ -279,12 +353,16 @@ byte accounting returns to zero.
 2. **Phase 2:** optional glommio integration: a heap per executor,
    `maintain()` from the reactor's idle path, byte accounting per task queue
    feeding the scheduler, allocation sampling on the slow path.
-3. **Phase 3:** remote frees. `Page::_thread_free` and `Segment::_owner` are
-   reserved. The candidate design is snmalloc-style message batching to the
-   owner, rather than mimalloc's per-free atomic. This gives a `Send` heap handle,
-   checked with Loom.
-4. **Phase 4:** `GlobalAlloc`: thread-local lookup, abandoned segments of exited
-   threads, re-entrancy, `fork`.
+3. **Phase 3:** a `Send` heap handle with remote frees, in two stages
+   (`docs/superpowers/specs/2026-11-19-remote-frees-design.md`).
+   - **Stage A (done):** thread heaps and `ShardAlloc` on one thread, with the
+     owner stamps and the check a global allocator pays; it ties mimalloc on
+     `lifo_64B` and beats it on the other three benchmarks.
+   - **Stage B:** snmalloc-style batches of remote frees sent to the owner's
+     inbox (one atomic per batch, not per free), exited threads' heaps parked
+     in a pool, `ShardAlloc` becomes `Send + Sync`; checked with Loom.
+4. **Phase 4:** `GlobalAlloc` over `ShardAlloc`: allocation before the
+   thread-local exists, re-entrancy, `fork`.
 
 ## Known limits (phase 1)
 

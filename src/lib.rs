@@ -34,8 +34,14 @@
 //! - [`StackArena`] bump-allocates scratch collections from a stack buffer, with a
 //!   fallback allocator.
 //!
-//! Phase 1 is single-threaded by design. Page and segment headers reserve fields
-//! for remote frees (phase 3) and an owner id. See `DESIGN.md`.
+//! Without passing a heap around:
+//!
+//! - [`ShardAlloc`] is a zero-sized handle for the current thread's own heap,
+//!   made on first use: the shape of a global allocator, paying a thread-local
+//!   lookup to allocate and an owner check to free.
+//!
+//! Everything is single-threaded for now: every handle is `!Send`. Remote frees
+//! (a `Send` `ShardAlloc`) are the next stage. See `DESIGN.md`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -47,10 +53,12 @@ mod os;
 mod reap;
 mod region;
 mod segment;
+mod shard;
 mod stack;
 
 pub use arena::{Arena, ArenaStats};
 pub use heap::{HugePages, LocalHeap, Stats};
 pub use os::Os;
 pub use reap::Reap;
+pub use shard::ShardAlloc;
 pub use stack::StackArena;

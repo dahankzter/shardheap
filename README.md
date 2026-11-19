@@ -112,16 +112,22 @@ much; see [DESIGN.md](DESIGN.md#fragmentation).
 ## Benchmarks: one lifetime profile at a time
 
 Median time per iteration through the same `Vec::new_in` / `Box::new_in` code
-(`cargo bench`, AMD Threadripper PRO 9975WX, rustc 1.100). Lower is better.
-Arenas (bumpalo and `Arena`) are reset inside every iteration, and the reset is
-part of their time.
+(`cargo bench` with `RUSTFLAGS='-C llvm-args=-align-loops=64'`, AMD
+Threadripper PRO 9975WX, rustc 1.100). Lower is better. Arenas (bumpalo and
+`Arena`) are reset inside every iteration, and the reset is part of their time.
 
-| workload | glibc | mimalloc | mimalloc `mi_heap` | **LocalHeap** | bumpalo | **Arena** |
-|---|---|---|---|---|---|---|
-| alloc/free one 64 B box, 10k times | 23.5 µs | 27.2 µs | 26.9 µs | **23.7 µs** | 8.44 µs | **8.39 µs** |
-| 10k mixed-size buffers live, then freed | 504 µs | 121 µs | 121 µs | **63.8 µs** | 16.1 µs | **14.4 µs** |
-| grow a `Vec<u64>` to 8 MiB | 217 µs | 318 µs | 317 µs | **251 µs** | 328 µs | **212 µs** |
-| build and drop a 32k-node boxed tree | 776 µs | 250 µs | 254 µs | **228 µs** | 207 µs | **196 µs** |
+| workload | glibc | mimalloc | mimalloc `mi_heap` | **LocalHeap** | **ShardAlloc** | bumpalo | **Arena** |
+|---|---|---|---|---|---|---|---|
+| alloc/free one 64 B box, 10k times | 23.6 µs | 25.0 µs | 26.8 µs | **23.6 µs** | **25.2 µs** | 8.5 µs | **8.3 µs** |
+| 10k mixed-size buffers live, then freed | 503 µs | 119 µs | 118 µs | **63.2 µs** | **85.8 µs** | 15.8 µs | **14.4 µs** |
+| grow a `Vec<u64>` to 8 MiB | 218 µs | 318 µs | 321 µs | **247 µs** | **249 µs** | 312 µs | **212 µs** |
+| build and drop a 32k-node boxed tree | 776 µs | 250 µs | 252 µs | **227 µs** | **230 µs** | 206 µs | **198 µs** |
+
+`ShardAlloc` finds the current thread's heap through a thread-local and checks
+the owner on every free, which is what a global allocator such as mimalloc
+does on every `malloc` and `free`. It ties mimalloc on the 64 B box loop and
+beats it on the other three; what it pays over `&LocalHeap` there is about
+0.15 ns per allocate/free pair ([DESIGN.md](DESIGN.md#thread-heaps-shardalloc)).
 
 The arenas win by doing almost nothing: allocation is an aligned pointer bump and
 freeing is free. That only works when objects die together; `LocalHeap` is the
@@ -166,8 +172,9 @@ and resident memory at the end (best of 3 runs, one process per allocator). Abou
 Phase 1 of a larger plan; [DESIGN.md](DESIGN.md) covers the layout, fast paths,
 how memory goes back to the OS, the unsafe surface, and the roadmap.
 
-- **Single-threaded by design.** Handles are `!Send`. Cross-thread frees
-  (phase 3) and use as `#[global_allocator]` (phase 4) are not implemented.
+- **Single-threaded for now.** Handles are `!Send`. `ShardAlloc` gives each
+  thread its own heap; sending its collections across threads (phase 3, stage B)
+  and use as `#[global_allocator]` (phase 4) are not implemented.
 - **Rust 1.100 or newer:** the `Allocator` trait was stabilized there.
 - **Linux** gets `mmap`, `mremap` and `madvise`. Other platforms, and Miri, take
   memory from the global allocator instead.

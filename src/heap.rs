@@ -127,6 +127,50 @@ struct LargeHeader {
     prev: *mut LargeHeader,
     map_size: usize,
     map_align: usize,
+    /// As `Segment::owner`.
+    owner: usize,
+}
+
+/// Pops a block from `page`'s `free` list, swapping in `local_free` when it is
+/// empty, or returns null if both are. Collecting our own frees inline matters:
+/// an alloc/free loop on one block would otherwise take the slow path every time.
+///
+/// # Safety
+/// `page` is a live page whose heap is in use by this thread only.
+#[inline(always)]
+unsafe fn pop_free(page: *mut Page) -> *mut Block {
+    // SAFETY: caller's contract.
+    unsafe {
+        let mut b = (*page).free;
+        if b.is_null() {
+            b = ptr::replace(&raw mut (*page).local_free, ptr::null_mut());
+        }
+        if !b.is_null() {
+            (*page).free = (*b).next;
+            (*page).used += 1;
+        }
+        b
+    }
+}
+
+/// The owner stamp of the large block at `p`, allocated with alignment `align`.
+///
+/// # Safety
+/// `p` is a live large block allocated with alignment `align`.
+#[inline(always)]
+unsafe fn large_owner(p: *mut u8, align: usize) -> usize {
+    // SAFETY: caller's contract; the header sits `large_offset` before the data.
+    unsafe { (*p.sub(large_offset(align)).cast::<LargeHeader>()).owner }
+}
+
+/// A block reached the wrong heap. Stage A has no remote frees, and safe code
+/// cannot get here (`ShardAlloc` is `!Send`), so this is memory corruption or
+/// misuse of unsafe code: stop before the heap is damaged.
+#[cold]
+#[inline(never)]
+fn foreign_free() -> ! {
+    eprintln!("shardheap: block freed on a thread that does not own it");
+    std::process::abort()
 }
 
 /// Distance from the start of a large mapping to the data.
@@ -163,6 +207,13 @@ pub(crate) struct Inner {
     huge_now: bool,
     /// Memory to take segments and large blocks from before the OS.
     region: Option<Region>,
+    /// For a thread heap (`ShardAlloc`), this heap's own address, which never
+    /// changes; 0 for an explicit heap. Stamped into every segment and large
+    /// header.
+    pub(crate) owner: usize,
+    /// Set when a thread heap's thread has exited: the free that empties the
+    /// heap afterwards (from a later thread-local destructor) trims it.
+    pub(crate) exited: bool,
 }
 
 /// A shared-nothing heap: one per thread (or executor), no atomics, no locks.
@@ -222,33 +273,7 @@ impl LocalHeap {
     /// An empty heap. Maps nothing until the first allocation.
     pub const fn new() -> Self {
         LocalHeap {
-            inner: UnsafeCell::new(Inner {
-                queues: [ptr::null_mut(); NUM_CLASSES],
-                segments: ptr::null_mut(),
-                large: ptr::null_mut(),
-                large_cache: [NO_MAP; LARGE_CACHE_SLOTS],
-                large_cache_bytes: 0,
-                tick: 0,
-                epoch_start: 0,
-                epoch_shift: 0,
-                refaulted: false,
-                clean_epochs: 0,
-                stats: Stats {
-                    allocated_bytes: 0,
-                    mapped_bytes: 0,
-                    segments: 0,
-                    empty_segments: 0,
-                    large_allocations: 0,
-                    reap_pages: 0,
-                    region_bytes: 0,
-                },
-                reap_page: ptr::null_mut(),
-                reap_ptr: ptr::null_mut(),
-                reap_end: ptr::null_mut(),
-                huge_pages: HugePages::Auto,
-                huge_now: false,
-                region: None,
-            }),
+            inner: UnsafeCell::new(Inner::new(HugePages::Auto)),
             _not_send: PhantomData,
         }
     }
@@ -256,9 +281,10 @@ impl LocalHeap {
     /// An empty heap with the given huge-page policy. [`new`](Self::new) uses
     /// [`HugePages::Auto`].
     pub const fn with_huge_pages(policy: HugePages) -> Self {
-        let mut heap = Self::new();
-        heap.inner.get_mut().huge_pages = policy;
-        heap
+        LocalHeap {
+            inner: UnsafeCell::new(Inner::new(policy)),
+            _not_send: PhantomData,
+        }
     }
 
     /// A heap that takes all its memory from one region of at least `bytes`
@@ -386,6 +412,39 @@ pub(crate) fn dangling(align: usize) -> NonNull<[u8]> {
 }
 
 impl Inner {
+    /// An empty heap with the given huge-page policy, owned by no thread record.
+    pub(crate) const fn new(huge_pages: HugePages) -> Inner {
+        Inner {
+            queues: [ptr::null_mut(); NUM_CLASSES],
+            segments: ptr::null_mut(),
+            large: ptr::null_mut(),
+            large_cache: [NO_MAP; LARGE_CACHE_SLOTS],
+            large_cache_bytes: 0,
+            tick: 0,
+            epoch_start: 0,
+            epoch_shift: 0,
+            refaulted: false,
+            clean_epochs: 0,
+            stats: Stats {
+                allocated_bytes: 0,
+                mapped_bytes: 0,
+                segments: 0,
+                empty_segments: 0,
+                large_allocations: 0,
+                reap_pages: 0,
+                region_bytes: 0,
+            },
+            reap_page: ptr::null_mut(),
+            reap_ptr: ptr::null_mut(),
+            reap_end: ptr::null_mut(),
+            huge_pages,
+            huge_now: false,
+            region: None,
+            owner: 0,
+            exited: false,
+        }
+    }
+
     // ---- allocation --------------------------------------------------------
 
     #[inline(always)]
@@ -409,21 +468,64 @@ impl Inner {
         unsafe {
             let page = *self.queues.get_unchecked(c);
             if !page.is_null() {
-                let mut b = (*page).free;
-                if b.is_null() {
-                    // Collect our own frees inline: an alloc/free loop on one block
-                    // would otherwise take the slow path every time.
-                    b = ptr::replace(&raw mut (*page).local_free, ptr::null_mut());
-                }
+                let b = pop_free(page);
                 if !b.is_null() {
-                    (*page).free = (*b).next;
-                    (*page).used += 1;
                     let bs = (*page).block_size;
                     self.stats.allocated_bytes += bs;
                     return Ok(slice(b.cast(), bs));
                 }
             }
             self.alloc_small_slow(c)
+        }
+    }
+
+    /// The small-block fast path through a raw pointer, for a heap that may be
+    /// the shared, read-only empty heap of `ShardAlloc`: `this` is only read
+    /// until a page in its queue yields a block, and the empty heap's queues
+    /// are all null. `None` means: take the slow path (on a real heap).
+    ///
+    /// # Safety
+    /// `this` is a live heap with no other reference in use, or a heap whose
+    /// queues are all null.
+    #[inline(always)]
+    pub(crate) unsafe fn alloc_fast(this: *mut Inner, layout: Layout) -> Option<NonNull<[u8]>> {
+        if layout.size() == 0 {
+            return Some(dangling(layout.align()));
+        }
+        let c = class::class_for(layout)?;
+        // SAFETY: caller's contract; `c < NUM_CLASSES`; queue pages are live
+        // pages of `this`, so a non-null one means `this` is a real heap.
+        unsafe {
+            let page = *(&raw const (*this).queues).cast::<*mut Page>().add(c);
+            if page.is_null() {
+                return None;
+            }
+            let b = pop_free(page);
+            if b.is_null() {
+                return None;
+            }
+            let bs = (*page).block_size;
+            (*this).stats.allocated_bytes += bs;
+            Some(slice(b.cast(), bs))
+        }
+    }
+
+    /// `alloc` after `alloc_fast` returned `None` on this heap: straight to the
+    /// slow path, without repeating the fast-path attempt.
+    ///
+    /// # Safety
+    /// `layout` is nonzero.
+    #[inline(always)]
+    pub(crate) unsafe fn alloc_miss(
+        &mut self,
+        layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: nonzero layout; `c` comes from `class_for`.
+        unsafe {
+            match class::class_for(layout) {
+                Some(c) => self.alloc_small_slow(c),
+                None => self.alloc_large(layout).map(|(b, _)| b),
+            }
         }
     }
 
@@ -525,6 +627,7 @@ impl Inner {
             ptr::write_bytes(page, 0, 1);
             (*page).start = seg.cast::<u8>().add(slot * SLOT_SIZE);
             (*page).span = k as u8;
+            (*page).owner = self.owner;
             Ok(page)
         }
     }
@@ -543,6 +646,7 @@ impl Inner {
                 ptr::write_bytes(base.as_ptr(), 0, core::mem::size_of::<Segment>());
             }
             let seg = segment::init_segment(base);
+            (*seg).owner = self.owner;
             (*seg).next = self.segments;
             if !self.segments.is_null() {
                 (*self.segments).prev = seg;
@@ -629,7 +733,90 @@ impl Inner {
         unsafe { os::advise_huge(p, size, huge) }
     }
 
+    /// `alloc` with the block zeroed; fresh large mappings are not cleared twice.
+    pub(crate) unsafe fn alloc_zeroed(
+        &mut self,
+        layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: `layout` takes the path matching its class, as in `alloc`.
+        unsafe {
+            if layout.size() != 0 && class::class_for(layout).is_none() {
+                let (b, fresh) = self.alloc_large(layout)?;
+                if !fresh {
+                    // A reused mapping; fresh ones are already zero.
+                    ptr::write_bytes(b.as_ptr().cast::<u8>(), 0, b.len());
+                }
+                return Ok(b);
+            }
+            let b = self.alloc(layout)?;
+            ptr::write_bytes(b.as_ptr().cast::<u8>(), 0, b.len());
+            Ok(b)
+        }
+    }
+
     // ---- deallocation ------------------------------------------------------
+
+    /// `dealloc` for a heap reached without proof of ownership (`ShardAlloc`).
+    /// A thread heap's owner stamp is its own address, so the check compares the
+    /// block's stamp with `this` before touching `this`: `ShardAlloc`'s empty
+    /// heap (a thread without a heap yet), which stamps nothing, or another
+    /// heap's address aborts.
+    ///
+    /// # Safety
+    /// As `dealloc`, except that the block may belong to another heap; `this` is
+    /// a live heap whose `owner` is its own address, or a heap that owns nothing.
+    #[inline(always)]
+    pub(crate) unsafe fn dealloc_owned(this: *mut Inner, p: *mut u8, layout: Layout) {
+        if layout.size() == 0 {
+            return;
+        }
+        // SAFETY: caller's contract: `p` is a live block allocated with `layout`
+        // by some heap, so its segment or large header is readable; `this` is
+        // dereferenced only once it matches the block's (nonzero) owner stamp.
+        unsafe {
+            match class::class_for(layout) {
+                Some(c) => {
+                    let page = segment::page_of(segment::segment_of(p), p);
+                    if (*page).owner != this.addr() {
+                        foreign_free();
+                    }
+                    (*this).free_small(p, c);
+                }
+                None => {
+                    if large_owner(p, layout.align()) != this.addr() {
+                        foreign_free();
+                    }
+                    (*this).free_large(p, layout);
+                }
+            }
+        }
+    }
+
+    /// `resize` with the owner check of `dealloc_owned` on `(p, old)`.
+    ///
+    /// # Safety
+    /// As `resize` and `dealloc_owned`, and `this` is a live heap (not the empty
+    /// one), with no other reference in use.
+    pub(crate) unsafe fn resize_owned(
+        this: *mut Inner,
+        p: *mut u8,
+        old: Layout,
+        new: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: as `dealloc_owned`.
+        unsafe {
+            if old.size() != 0 {
+                let owner = match class::class_for(old) {
+                    Some(_) => (*segment::page_of(segment::segment_of(p), p)).owner,
+                    None => large_owner(p, old.align()),
+                };
+                if owner != this.addr() {
+                    foreign_free();
+                }
+            }
+            (*this).resize(p, old, new)
+        }
+    }
 
     #[inline(always)]
     pub(crate) unsafe fn dealloc(&mut self, p: *mut u8, layout: Layout) {
@@ -677,7 +864,18 @@ impl Inner {
             }
             if (*page).used == 0 {
                 self.retire(page);
+                self.trim_if_exited();
             }
+        }
+    }
+
+    /// After the owning thread exited, the free that leaves nothing allocated
+    /// returns everything to the OS. Called only from free slow paths.
+    #[inline]
+    fn trim_if_exited(&mut self) {
+        if self.exited && self.stats.allocated_bytes == 0 {
+            // SAFETY: nothing is allocated, so nothing references the memory.
+            unsafe { self.trim() }
         }
     }
 
@@ -801,7 +999,7 @@ impl Inner {
         }
     }
 
-    unsafe fn maintain(&mut self) {
+    pub(crate) unsafe fn maintain(&mut self) {
         self.tick += HEARTBEAT;
         // SAFETY: as `heartbeat`.
         unsafe { self.purge_idle() }
@@ -908,7 +1106,7 @@ impl Inner {
         }
     }
 
-    unsafe fn trim(&mut self) {
+    pub(crate) unsafe fn trim(&mut self) {
         // SAFETY: queues and the segment list hold live pages/segments of this heap.
         unsafe {
             self.release_kept_pages(0);
@@ -1030,6 +1228,7 @@ impl Inner {
                 prev: ptr::null_mut(),
                 map_size,
                 map_align,
+                owner: self.owner,
             });
             if !self.large.is_null() {
                 (*self.large).prev = h;
@@ -1131,6 +1330,7 @@ impl Inner {
                 self.stats.mapped_bytes -= size;
                 self.unmap(NonNull::new_unchecked(h.cast()), size, align);
             }
+            self.trim_if_exited();
         }
     }
 
@@ -1284,21 +1484,7 @@ unsafe impl Allocator for LocalHeap {
 
     fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         // SAFETY: see `inner`.
-        let inner = unsafe { self.inner() };
-        if layout.size() != 0 && class::class_for(layout).is_none() {
-            // SAFETY: nonzero layout on the large path.
-            let (b, fresh) = unsafe { inner.alloc_large(layout)? };
-            if !fresh {
-                // SAFETY: a reused mapping of `b.len()` bytes; fresh ones are already zero.
-                unsafe { ptr::write_bytes(b.as_ptr().cast::<u8>(), 0, b.len()) };
-            }
-            return Ok(b);
-        }
-        // SAFETY: as `allocate`.
-        let b = unsafe { inner.alloc(layout)? };
-        // SAFETY: `b` is a fresh block of `b.len()` bytes.
-        unsafe { ptr::write_bytes(b.as_ptr().cast::<u8>(), 0, b.len()) };
-        Ok(b)
+        unsafe { self.inner().alloc_zeroed(layout) }
     }
 
     #[inline(always)]
@@ -1426,6 +1612,60 @@ mod tests {
             // SAFETY: allocated with `L`.
             unsafe { heap.deallocate(b, L) };
         }
+    }
+
+    /// The owner stamp of the block at `p`, allocated with `l`.
+    fn owner_of(p: NonNull<u8>, l: Layout) -> usize {
+        // SAFETY: a live block of a heap, allocated with `l`.
+        unsafe {
+            if class::class_for(l).is_some() {
+                let seg = segment::segment_of(p.as_ptr());
+                let page_owner = (*segment::page_of(seg, p.as_ptr())).owner;
+                assert_eq!(page_owner, (*seg).owner, "page and segment stamps agree");
+                page_owner
+            } else {
+                (*p.as_ptr()
+                    .sub(large_offset(l.align()))
+                    .cast::<LargeHeader>())
+                .owner
+            }
+        }
+    }
+
+    const OWNER_LAYOUTS: [(usize, usize); 3] = [(64, 8), (1 << 20, 8), (300_000, 1 << 16)];
+
+    #[test]
+    fn explicit_heaps_stamp_owner_zero() {
+        let heap = LocalHeap::new();
+        for (size, align) in OWNER_LAYOUTS {
+            let l = Layout::from_size_align(size, align).unwrap();
+            let p = heap.allocate(l).unwrap().cast::<u8>();
+            assert_eq!(owner_of(p, l), 0);
+            // SAFETY: allocated above with `l`.
+            unsafe { heap.deallocate(p, l) };
+        }
+    }
+
+    #[test]
+    fn owned_frees_and_resizes_pass_the_owner_check() {
+        let heap = LocalHeap::new();
+        let this = heap.inner.get();
+        // SAFETY: no other reference to the inner heap is live; the heap does
+        // not move during the test, as a thread heap never moves.
+        unsafe { (*this).owner = this.addr() };
+        for (size, align) in OWNER_LAYOUTS {
+            let l = Layout::from_size_align(size, align).unwrap();
+            let p = heap.allocate(l).unwrap().cast::<u8>();
+            assert_eq!(owner_of(p, l), this.addr());
+            let big = Layout::from_size_align(size * 2, align).unwrap();
+            // SAFETY: `p` is live with `l`; no other reference to the inner heap.
+            unsafe {
+                let q = Inner::resize_owned(this, p.as_ptr(), l, big).unwrap();
+                assert_eq!(owner_of(q.cast(), big), this.addr());
+                Inner::dealloc_owned(this, q.as_ptr().cast(), big);
+            }
+        }
+        assert_eq!(heap.stats().allocated_bytes, 0);
     }
 
     #[cfg(all(target_os = "linux", not(miri)))]
