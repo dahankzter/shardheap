@@ -7,7 +7,7 @@
 //! in a different order than they were allocated.
 //!
 //! ```text
-//! cargo run --release --example request_mix -- <allocator> [survive_permille] [window]
+//! cargo run --release --example request_mix -- <allocator> [survive_permille] [window] [huge_pages]
 //! ```
 //!
 //! Allocators:
@@ -27,7 +27,7 @@ use std::hint::black_box;
 use std::ptr::NonNull;
 use std::time::Instant;
 
-use shardheap::{Arena, LocalHeap};
+use shardheap::{Arena, HugePages, LocalHeap};
 
 struct MiGlobal;
 
@@ -206,6 +206,13 @@ fn main() {
     let which = args.get(1).map(String::as_str).unwrap_or("reap");
     let permille: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50);
     let window: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
+    let huge = match args.get(4).map(String::as_str).unwrap_or("auto") {
+        "auto" => HugePages::Auto,
+        "always" => HugePages::Always,
+        "never" => HugePages::Never,
+        "kernel" => HugePages::Kernel,
+        other => panic!("unknown huge-page policy {other}"),
+    };
     let w = Workload::new(permille, window);
     let (rss0, _) = rss_kib();
 
@@ -220,14 +227,14 @@ fn main() {
             drive(|n| w.request(n, &MiGlobal, &|v| v, &mut cache))
         }
         "heap" => {
-            let heap = LocalHeap::new();
+            let heap = LocalHeap::with_huge_pages(huge);
             let mut cache = VecDeque::new();
             let r = drive(|n| w.request(n, &heap, &|v| v, &mut cache));
             extra = format!("heap mapped {} KiB", heap.stats().mapped_bytes >> 10);
             r
         }
         "reap" => {
-            let heap = LocalHeap::new();
+            let heap = LocalHeap::with_huge_pages(huge);
             let reap = heap.reap();
             let mut cache = VecDeque::new();
             let r = drive(|n| w.request(n, reap, &|v| v, &mut cache));
@@ -240,7 +247,7 @@ fn main() {
             r
         }
         "arena" => {
-            let heap = LocalHeap::new();
+            let heap = LocalHeap::with_huge_pages(huge);
             let mut arena = Arena::new_in(&heap);
             let mut cache = VecDeque::new();
             let r = drive(|n| {

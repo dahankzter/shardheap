@@ -57,6 +57,43 @@ need, and cannot use what Rust already knows:
 | `Reap` (`heap.reap()`) | pointer bump in heap pages | decrement the page's count; empty pages return to the heap | mostly die together, survivors that cannot be copied out |
 | `StackArena` | bump in a stack buffer, then a fallback allocator | newest block only | scratch collections in one function |
 
+Any of them can sit on a heap whose memory is one registered region
+(`LocalHeap::with_region`), for I/O buffers that need no copy.
+
+## Registered I/O memory
+
+`LocalHeap::with_region(bytes, HugePages::Auto)` takes all its memory from one
+region mapped up front, so every block (and every `Arena` or `Reap` block on
+it) lies in a range that can be registered once with io_uring, RDMA or a
+shared-memory window:
+
+```rust
+use shardheap::{HugePages, LocalHeap};
+
+let heap = LocalHeap::with_region(64 << 20, HugePages::Auto).unwrap();
+let region = heap.region().unwrap();       // register this once
+let mut payload: Vec<u8, &LocalHeap> = Vec::new_in(&heap);
+payload.extend_from_slice(b"built with ordinary std APIs");
+payload.resize(64 << 10, 0);
+assert!(heap.in_region(payload.as_ptr())); // so: a fixed-buffer write, no copy
+```
+
+Region memory is never unmapped, purged or remapped while the heap lives
+(registered pages are pinned); large blocks grow in place into free space after
+them. When the region is full, the heap falls back to the OS and `in_region`
+says so. In a glommio prototype this cut CPU per 1 MiB O_DIRECT write by 62%
+against building a `Vec<u8>` and copying it into a registered buffer.
+
+## Huge pages
+
+`LocalHeap::new()` follows the kernel's transparent-huge-page policy while the
+heap is small and asks for 2 MiB pages once it maps 16 MiB
+(`HugePages::Auto`); `with_huge_pages` selects `Always`, `Never` or `Kernel`.
+On Zen 5, huge pages made building 256 MiB of nodes 2.1x faster (98x fewer page
+faults) and random pointer chasing 10-45% faster from 1 MiB to 256 MiB working
+sets, for 1-3 MiB more resident memory per heap. Details in
+[DESIGN.md](DESIGN.md#huge-pages).
+
 ## Benchmarks: one lifetime profile at a time
 
 Median time per iteration through the same `Vec::new_in` / `Box::new_in` code
@@ -128,6 +165,7 @@ cargo test
 MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test
 cargo bench          # vs glibc, mimalloc, mimalloc first-class heaps, bumpalo
 cargo run --release --example request_mix -- reap 50 64   # allocator, survivors ‰, window
+cargo run --release --example thp -- auto                 # huge-page policy
 ```
 
 ## License

@@ -8,6 +8,7 @@ use core::ptr::{self, NonNull};
 
 use crate::class::{self, NUM_CLASSES};
 use crate::os::{self, PAGE};
+use crate::region::Region;
 use crate::segment::{self, Block, MAGIC, Page, SEGMENT_SIZE, SLOT_SIZE, Segment};
 
 /// Empty segments kept mapped for reuse; further empty segments are unmapped.
@@ -26,6 +27,42 @@ const RETIRE_DELAY: u64 = 256;
 const LARGE_CACHE_SLOTS: usize = 8;
 /// Upper bound on the bytes held in the large-mapping cache.
 const LARGE_CACHE_MAX_BYTES: usize = 64 << 20;
+
+/// Under [`HugePages::Auto`], segments ask for huge pages once the heap maps
+/// this much. Huge pages cost about 1-3 MiB of extra resident memory per heap
+/// (partly used 2 MiB pages), which is noise from here on.
+const HUGE_AFTER: usize = 16 << 20;
+/// Under [`HugePages::Auto`], large mappings of at least this size ask for huge
+/// pages.
+const HUGE_LARGE_MIN: usize = 4 << 20;
+
+/// How a [`LocalHeap`] uses transparent huge pages (2 MiB pages on x86-64 Linux;
+/// elsewhere every setting behaves like `Kernel`).
+///
+/// Huge pages cut page faults by up to 512x and TLB misses, but memory becomes
+/// resident in 2 MiB steps, so a heap holds 1-3 MiB more than it uses. Measured
+/// on Zen 5 (see `DESIGN.md`): building 256 MiB of nodes 2.1x faster, random
+/// pointer chasing 10-45% faster from 1 MiB to 256 MiB working sets, and a
+/// request workload using 1 MiB holding 4 MiB instead of 1.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HugePages {
+    /// Follow the kernel's policy while the heap is small; once it maps 16 MiB,
+    /// ask for huge pages even where the policy is `madvise`: new segments
+    /// immediately, existing ones when `khugepaged` gets to them (in the
+    /// background; nothing is collapsed synchronously). Large mappings of at
+    /// least 4 MiB always ask. Never refuses huge pages the kernel would give.
+    #[default]
+    Auto,
+    /// Every segment and large mapping asks for huge pages (`MADV_HUGEPAGE`),
+    /// including on kernels whose policy is `madvise`.
+    Always,
+    /// Never use huge pages (`MADV_NOHUGEPAGE`), even where the kernel's policy
+    /// is `always`: the leanest choice for many small heaps.
+    Never,
+    /// Leave the system policy (`/sys/kernel/mm/transparent_hugepage/enabled`)
+    /// in charge.
+    Kernel,
+}
 
 /// A freed large mapping kept mapped (and its pages resident) for reuse.
 #[derive(Clone, Copy)]
@@ -57,6 +94,9 @@ pub struct Stats {
     /// Pages held by the [`Reap`](crate::Reap): the current bump page plus every
     /// earlier one that still has a live block.
     pub reap_pages: usize,
+    /// Bytes taken from the heap's region (see [`LocalHeap::with_region`]),
+    /// in 64 KiB granules: segments, large blocks and cached large blocks.
+    pub region_bytes: usize,
 }
 
 /// Header at the start of every large mapping. Large mappings form an intrusive
@@ -90,6 +130,11 @@ pub(crate) struct Inner {
     pub(crate) reap_ptr: *mut u8,
     /// End of `reap_page`.
     pub(crate) reap_end: *mut u8,
+    huge_pages: HugePages,
+    /// Whether the heap has crossed `HUGE_AFTER` under `HugePages::Auto`.
+    huge_now: bool,
+    /// Memory to take segments and large blocks from before the OS.
+    region: Option<Region>,
 }
 
 /// A shared-nothing heap: one per thread (or executor), no atomics, no locks.
@@ -163,13 +208,80 @@ impl LocalHeap {
                     empty_segments: 0,
                     large_allocations: 0,
                     reap_pages: 0,
+                    region_bytes: 0,
                 },
                 reap_page: ptr::null_mut(),
                 reap_ptr: ptr::null_mut(),
                 reap_end: ptr::null_mut(),
+                huge_pages: HugePages::Auto,
+                huge_now: false,
+                region: None,
             }),
             _not_send: PhantomData,
         }
+    }
+
+    /// An empty heap with the given huge-page policy. [`new`](Self::new) uses
+    /// [`HugePages::Auto`].
+    pub const fn with_huge_pages(policy: HugePages) -> Self {
+        let mut heap = Self::new();
+        heap.inner.get_mut().huge_pages = policy;
+        heap
+    }
+
+    /// A heap that takes all its memory from one region of at least `bytes`
+    /// (rounded up to 4 MiB), mapped now and owned by the heap, and from the OS
+    /// only once the region is full. `None` if the region cannot be mapped.
+    ///
+    /// Every block of the heap, and of an [`Arena`](crate::Arena) or
+    /// [`Reap`](crate::Reap) on it, then lies in one known range, which is what
+    /// io_uring registered buffers (`IORING_REGISTER_BUFFERS`), RDMA memory
+    /// regions or a shared-memory window need. Register [`region`](Self::region)
+    /// once, then check each buffer with [`in_region`](Self::in_region): inside
+    /// means a fixed-buffer operation, outside (the OS fallback) a regular one.
+    ///
+    /// Region memory is never unmapped, purged or moved with `mremap` while the
+    /// heap lives, because registered memory is pinned. Huge pages follow
+    /// `huge_pages` (`Auto` asks for them: a registered region is resident
+    /// anyway, so they cost nothing).
+    ///
+    /// ```
+    /// use shardheap::{HugePages, LocalHeap};
+    ///
+    /// let heap = LocalHeap::with_region(8 << 20, HugePages::Auto).unwrap();
+    /// let region = heap.region().unwrap();
+    /// assert_eq!(region.len(), 8 << 20);
+    /// // ... register `region` with io_uring ...
+    ///
+    /// let mut payload: Vec<u8, &LocalHeap> = Vec::new_in(&heap);
+    /// payload.extend_from_slice(b"header");
+    /// payload.resize(64 << 10, 0);
+    /// assert!(heap.in_region(payload.as_ptr())); // submit with WRITE_FIXED
+    /// ```
+    pub fn with_region(bytes: usize, huge_pages: HugePages) -> Option<Self> {
+        let advice = match huge_pages {
+            HugePages::Auto | HugePages::Always => Some(true),
+            HugePages::Never => Some(false),
+            HugePages::Kernel => None,
+        };
+        let region = Region::map(bytes, advice)?;
+        let mut heap = Self::with_huge_pages(huge_pages);
+        heap.inner.get_mut().region = Some(region);
+        Some(heap)
+    }
+
+    /// The heap's region (see [`with_region`](Self::with_region)), if it has one.
+    pub fn region(&self) -> Option<NonNull<[u8]>> {
+        // SAFETY: see `stats`.
+        unsafe { (*self.inner.get()).region.as_ref().map(Region::range) }
+    }
+
+    /// Whether `p` lies in the heap's region. A block allocated from the heap
+    /// lies entirely inside or entirely outside it.
+    #[inline]
+    pub fn in_region(&self, p: *const u8) -> bool {
+        // SAFETY: see `stats`.
+        unsafe { (*self.inner.get()).region.as_ref() }.is_some_and(|r| r.contains(p))
     }
 
     /// Current counters.
@@ -365,7 +477,16 @@ impl Inner {
     unsafe fn new_segment(&mut self) -> Result<*mut Segment, AllocError> {
         // SAFETY: valid size and alignment; the mapping is fresh and zeroed.
         unsafe {
-            let base = os::map_aligned(SEGMENT_SIZE, SEGMENT_SIZE).ok_or(AllocError)?;
+            let (base, zeroed) = self.map(SEGMENT_SIZE, SEGMENT_SIZE).ok_or(AllocError)?;
+            if zeroed {
+                if !self.huge_now && self.stats.mapped_bytes >= HUGE_AFTER {
+                    self.switch_to_huge();
+                }
+                self.advise(base, SEGMENT_SIZE, self.huge_now);
+            } else {
+                // Reused region memory: `init_segment` needs a zeroed header.
+                ptr::write_bytes(base.as_ptr(), 0, core::mem::size_of::<Segment>());
+            }
             let seg = segment::init_segment(base);
             (*seg).next = self.segments;
             if !self.segments.is_null() {
@@ -377,6 +498,80 @@ impl Inner {
             self.stats.mapped_bytes += SEGMENT_SIZE;
             Ok(seg)
         }
+    }
+
+    /// The heap has grown past `HUGE_AFTER`: from now on segments ask for huge
+    /// pages, and existing ones are re-advised so `khugepaged` can collapse them.
+    #[cold]
+    fn switch_to_huge(&mut self) {
+        self.huge_now = true;
+        if self.huge_pages != HugePages::Auto {
+            return;
+        }
+        let mut seg = self.segments;
+        while !seg.is_null() {
+            // SAFETY: the segment list holds live segments of this heap.
+            unsafe {
+                if !self.in_region(seg.cast()) {
+                    os::advise_huge(NonNull::new_unchecked(seg.cast()), SEGMENT_SIZE, true);
+                }
+                seg = (*seg).next;
+            }
+        }
+    }
+
+    /// Takes `size` bytes aligned to `align` from the region, or else from the
+    /// OS; returns whether the memory is zeroed (fresh OS memory is).
+    ///
+    /// # Safety
+    /// `size` is a nonzero multiple of `PAGE`; `align` a power of two `>= PAGE`.
+    unsafe fn map(&mut self, size: usize, align: usize) -> Option<(NonNull<u8>, bool)> {
+        if let Some(r) = &mut self.region
+            && let Some(p) = r.alloc(size, align)
+        {
+            self.stats.region_bytes = r.used_bytes;
+            return Some((p, false));
+        }
+        // SAFETY: caller's contract.
+        unsafe { os::map_aligned(size, align) }.map(|p| (p, true))
+    }
+
+    /// Returns memory from `map` to the region or the OS.
+    ///
+    /// # Safety
+    /// `p`, `size`, `align` are exactly as passed to and returned by `map`, and
+    /// nothing uses the memory any more.
+    unsafe fn unmap(&mut self, p: NonNull<u8>, size: usize, align: usize) {
+        if let Some(r) = &mut self.region
+            && r.contains(p.as_ptr())
+        {
+            r.free(p, size);
+            self.stats.region_bytes = r.used_bytes;
+            return;
+        }
+        // SAFETY: caller's contract.
+        unsafe { os::unmap(p, size, align) }
+    }
+
+    fn in_region(&self, p: *const u8) -> bool {
+        self.region.as_ref().is_some_and(|r| r.contains(p))
+    }
+
+    /// Applies the huge-page policy to a fresh mapping; `auto` is the decision
+    /// under [`HugePages::Auto`].
+    ///
+    /// # Safety
+    /// The range is a mapping of this heap.
+    unsafe fn advise(&self, p: NonNull<u8>, size: usize, auto: bool) {
+        let huge = match self.huge_pages {
+            HugePages::Auto if auto => true,
+            HugePages::Auto => return,
+            HugePages::Always => true,
+            HugePages::Never => false,
+            HugePages::Kernel => return,
+        };
+        // SAFETY: caller's contract.
+        unsafe { os::advise_huge(p, size, huge) }
     }
 
     // ---- deallocation ------------------------------------------------------
@@ -491,7 +686,7 @@ impl Inner {
             if (*seg).used_slots == 1 {
                 self.stats.empty_segments -= 1;
             }
-            os::unmap(
+            self.unmap(
                 NonNull::new_unchecked(seg.cast()),
                 SEGMENT_SIZE,
                 SEGMENT_SIZE,
@@ -559,6 +754,7 @@ impl Inner {
                 if (*seg).used_slots == 1
                     && !(*seg).purged
                     && self.tick - (*seg).idle_since >= PURGE_DELAY
+                    && !self.in_region(seg.cast())
                 {
                     let slots = NonNull::new_unchecked(seg.cast::<u8>().add(SLOT_SIZE));
                     os::purge(slots, SEGMENT_SIZE - SLOT_SIZE);
@@ -643,7 +839,7 @@ impl Inner {
             let mut seg = self.segments;
             while !seg.is_null() {
                 let next = (*seg).next;
-                os::unmap(
+                self.unmap(
                     NonNull::new_unchecked(seg.cast()),
                     SEGMENT_SIZE,
                     SEGMENT_SIZE,
@@ -673,9 +869,12 @@ impl Inner {
             {
                 Some(m) => (NonNull::new_unchecked(m.base), m.size, false),
                 None => {
-                    let base = os::map_aligned(need, map_align).ok_or(AllocError)?;
+                    let (base, zeroed) = self.map(need, map_align).ok_or(AllocError)?;
+                    if zeroed {
+                        self.advise(base, need, need >= HUGE_LARGE_MIN);
+                    }
                     self.stats.mapped_bytes += need;
-                    (base, need, true)
+                    (base, need, zeroed)
                 }
             };
             Ok((self.link_large(base, map_size, map_align, off), fresh))
@@ -758,7 +957,7 @@ impl Inner {
         self.large_cache_bytes -= m.size;
         self.stats.mapped_bytes -= m.size;
         // SAFETY: an unused, page-aligned mapping of this heap.
-        unsafe { os::unmap(NonNull::new_unchecked(m.base), m.size, PAGE) };
+        unsafe { self.unmap(NonNull::new_unchecked(m.base), m.size, PAGE) };
     }
 
     /// Unmaps cached mappings idle for at least `delay` ticks.
@@ -797,7 +996,7 @@ impl Inner {
             self.stats.allocated_bytes -= size;
             if align != PAGE || !self.put_cached(h.cast(), size) {
                 self.stats.mapped_bytes -= size;
-                os::unmap(NonNull::new_unchecked(h.cast()), size, align);
+                self.unmap(NonNull::new_unchecked(h.cast()), size, align);
             }
         }
     }
@@ -811,7 +1010,7 @@ impl Inner {
                 let (size, align) = ((*h).map_size, (*h).map_align);
                 self.stats.allocated_bytes -= size;
                 self.stats.mapped_bytes -= size;
-                os::unmap(NonNull::new_unchecked(h.cast()), size, align);
+                self.unmap(NonNull::new_unchecked(h.cast()), size, align);
                 h = next;
             }
             self.large = ptr::null_mut();
@@ -842,6 +1041,19 @@ impl Inner {
                     return Ok(slice(p, old_map - PAGE));
                 }
                 if new_map > old_map
+                    && let Some(r) = &mut self.region
+                    && r.contains(h.cast())
+                    && r.try_grow(NonNull::new_unchecked(h.cast()), old_map, new_map)
+                {
+                    // Region memory cannot be remapped, but the granules after it
+                    // were free: grown in place, no copy.
+                    self.stats.region_bytes = r.used_bytes;
+                    (*h).map_size = new_map;
+                    self.stats.allocated_bytes = self.stats.allocated_bytes - old_map + new_map;
+                    self.stats.mapped_bytes = self.stats.mapped_bytes - old_map + new_map;
+                    return Ok(slice(p, new_map - PAGE));
+                }
+                if new_map > old_map
                     && let Some(m) = self.take_cached(new_map)
                 {
                     // Resident memory beats `mremap` plus page faults on the tail.
@@ -851,7 +1063,12 @@ impl Inner {
                     self.free_large(p, old);
                     return Ok(n);
                 }
-                if let Some(nb) = os::remap(NonNull::new_unchecked(h.cast()), old_map, new_map) {
+                // Never move region memory: it may be registered and pinned.
+                if !self.in_region(h.cast())
+                    && let Some(nb) = os::remap(NonNull::new_unchecked(h.cast()), old_map, new_map)
+                {
+                    // The advice moves with the mapping; re-decide for the new size.
+                    self.advise(nb, new_map, new_map >= HUGE_LARGE_MIN);
                     let nh = nb.as_ptr().cast::<LargeHeader>();
                     (*nh).map_size = new_map;
                     let (prev, next) = ((*nh).prev, (*nh).next);

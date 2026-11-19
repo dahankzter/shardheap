@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
-use shardheap::{Arena, LocalHeap, StackArena};
+use shardheap::{Arena, HugePages, LocalHeap, StackArena};
 
 fn rng(mut s: u64) -> impl FnMut() -> u64 {
     move || {
@@ -184,6 +184,76 @@ fn local_heap_model() {
     heap.trim();
     assert_eq!(heap.stats().segments, 0);
     assert_eq!(heap.stats().mapped_bytes, 0);
+}
+
+#[test]
+fn every_huge_page_policy() {
+    for (i, policy) in [
+        HugePages::Auto,
+        HugePages::Always,
+        HugePages::Never,
+        HugePages::Kernel,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let heap = LocalHeap::with_huge_pages(policy);
+        // Past the Auto threshold (16 MiB), so the switch is exercised too.
+        let mut v: Vec<u64, &LocalHeap> = Vec::new_in(&heap);
+        v.extend(0..if cfg!(miri) { 10_000 } else { 3_000_000 });
+        let boxes: Vec<Box<[u8; 1000], &LocalHeap>> = (0..if cfg!(miri) { 50 } else { 20_000 })
+            .map(|j| Box::new_in([j as u8; 1000], &heap))
+            .collect();
+        run_model_with(&heap, 20 + i as u64, OPS / 10, true);
+        assert!(boxes.iter().enumerate().all(|(j, b)| b[999] == j as u8));
+        drop((v, boxes));
+        assert_eq!(heap.stats().allocated_bytes, 0);
+    }
+}
+
+#[test]
+fn region_heap_model() {
+    // 8 MiB: two segments, so the model also overflows to the OS fallback.
+    let heap = LocalHeap::with_region(8 << 20, HugePages::Auto).unwrap();
+    run_model(&heap, 30);
+    run_model(&heap.reap(), 31);
+    {
+        let mut arena = Arena::new_in(&heap);
+        run_model_with(&arena, 32, OPS / 5, false);
+        arena.reset();
+    }
+    assert_eq!(heap.stats().allocated_bytes, 0);
+    heap.trim();
+    let s = heap.stats();
+    assert_eq!((s.segments, s.region_bytes, s.mapped_bytes), (0, 0, 0));
+}
+
+#[test]
+fn region_blocks_are_inside_until_it_is_full() {
+    let heap = LocalHeap::with_region(4 << 20, HugePages::Kernel).unwrap();
+    let region = heap.region().unwrap();
+    let mut small = Vec::new();
+    // One segment: its 63 usable slots hold 63 * 64 KiB of 4 KiB blocks.
+    for _ in 0..63 * 16 {
+        small.push(Box::new_in([7u8; 4096], &heap));
+    }
+    assert!(small.iter().all(|b| heap.in_region(b.as_ptr())));
+    let spill = Box::new_in([8u8; 4096], &heap);
+    assert!(!heap.in_region(spill.as_ptr()), "region full: OS fallback");
+    let big: Vec<u8, &LocalHeap> = Vec::with_capacity_in(1 << 20, &heap);
+    assert!(!heap.in_region(big.as_ptr()));
+    assert_eq!(heap.stats().region_bytes, region.len());
+    drop((small, spill, big));
+    heap.trim();
+    assert_eq!(heap.stats().region_bytes, 0);
+    // Freed region memory is reused, and handed out zeroed where asked.
+    let l = Layout::from_size_align(300_000, 8).unwrap();
+    let z = heap.allocate_zeroed(l).unwrap();
+    let p = z.cast::<u8>();
+    assert!(heap.in_region(p.as_ptr()));
+    check(p, l.size(), 0);
+    // SAFETY: allocated above with `l`.
+    unsafe { heap.deallocate(p, l) };
 }
 
 #[test]

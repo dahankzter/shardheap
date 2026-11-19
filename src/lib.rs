@@ -20,6 +20,8 @@
 //!   split) comes from the layout instead of a metadata lookup.
 //! - The heap is an explicit value, not a thread-local lookup.
 //! - Built-in byte accounting ([`Stats`]) and arena-style [`LocalHeap::reset`].
+//! - Optionally all memory from one fixed region ([`LocalHeap::with_region`]),
+//!   for io_uring registered buffers, and a huge-page policy ([`HugePages`]).
 //!
 //! For objects with other lifetime profiles:
 //!
@@ -43,11 +45,12 @@ mod class;
 mod heap;
 mod os;
 mod reap;
+mod region;
 mod segment;
 mod stack;
 
 pub use arena::{Arena, ArenaStats};
-pub use heap::{LocalHeap, Stats};
+pub use heap::{HugePages, LocalHeap, Stats};
 pub use os::Os;
 pub use reap::Reap;
 pub use stack::StackArena;

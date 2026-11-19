@@ -72,6 +72,21 @@ mod imp {
         }
     }
 
+    /// Asks for (`true`) or refuses (`false`) transparent huge pages on a range.
+    ///
+    /// # Safety
+    /// The range is one of our mappings.
+    pub(crate) unsafe fn advise_huge(p: NonNull<u8>, size: usize, huge: bool) {
+        let advice = if huge {
+            libc::MADV_HUGEPAGE
+        } else {
+            libc::MADV_NOHUGEPAGE
+        };
+        // SAFETY: caller guarantees the range is ours. Failure (no THP support)
+        // leaves the kernel's policy in place, which is harmless.
+        unsafe { libc::madvise(p.as_ptr().cast(), size, advice) };
+    }
+
     /// Returns the physical pages to the OS; the range reads as zero afterwards.
     ///
     /// # Safety
@@ -103,9 +118,11 @@ mod imp {
     }
 
     pub(crate) unsafe fn purge(_p: NonNull<u8>, _size: usize) {}
+
+    pub(crate) unsafe fn advise_huge(_p: NonNull<u8>, _size: usize, _huge: bool) {}
 }
 
-pub(crate) use imp::{map_aligned, purge, remap, unmap};
+pub(crate) use imp::{advise_huge, map_aligned, purge, remap, unmap};
 
 use core::alloc::{AllocError, Allocator, Layout};
 

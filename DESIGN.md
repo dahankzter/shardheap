@@ -57,6 +57,73 @@ What the benchmarks showed along the way:
 - A `last` field and a whole-struct counter update per operation made the
   alloc/free loop 40% slower than bumpalo. Removing both made it a tie.
 
+## Region-backed heaps
+
+`LocalHeap::with_region(bytes, huge_pages)` maps one region up front (rounded up
+to 4 MiB, 4 MiB-aligned) and takes all memory from it, falling back to the OS
+only when it is full. Built for io_uring registered buffers: register
+`heap.region()` once, then `heap.in_region(p)` decides between a fixed-buffer
+and a regular operation. The same holds for an `Arena` or `Reap` on the heap.
+
+- **Granules:** 64 KiB, tracked in a bitmap (one bit each, 2 KiB of bitmap per
+  GiB). Segments take 64 granules at a 4 MiB-aligned position, large blocks a
+  first-fit run. Alignment above 4 MiB goes to the OS.
+- **Pinned memory is never discarded.** Region memory is not unmapped,
+  `madvise(MADV_DONTNEED)`ed or moved with `mremap` while the heap lives:
+  registered pages are pinned, and replacing them would leave the device writing
+  to the old physical pages. Freed granules only return to the bitmap.
+- **Growth without mremap:** a large block grows in place when the granules
+  after it are free; otherwise it is copied.
+- **Reused memory is not zero:** segment headers are zeroed on reuse, and
+  `allocate_zeroed` zeroes reused large blocks.
+- **Huge pages:** `Auto` and `Always` advise the whole region `MADV_HUGEPAGE`.
+  A registered region is resident anyway, so they cost no memory, and the
+  region is pinned as 2 MiB pages. (The effect on pinning time was not
+  measured.)
+
+In glommio (`registered-vec` prototype), a `Vec<u8, IoAlloc>` on such a heap,
+built with `extend_from_slice` and written with `WRITE_FIXED`, took 62% less
+CPU per 1 MiB O_DIRECT write than building a `Vec<u8>` and copying it into a
+registered `DmaBuffer`. See glommio's `docs/investigations/registered-vec`.
+
+## Huge pages
+
+Segments are 4 MiB and 4 MiB-aligned, so each is two 2 MiB transparent huge
+pages. `LocalHeap::with_huge_pages` picks the policy; `new()` uses `Auto`:
+
+- **Auto:** while the heap is small, the kernel's policy applies (no advice).
+  Once it maps 16 MiB, new segments get `MADV_HUGEPAGE`, existing ones are
+  re-advised so `khugepaged` collapses them in the background, and large
+  mappings of at least 4 MiB are always advised. It never refuses huge pages.
+  `MADV_COLLAPSE` is avoided on purpose: it collapses synchronously and would
+  stall a reactor thread.
+- **Always** / **Never:** `MADV_HUGEPAGE` / `MADV_NOHUGEPAGE` on every mapping.
+- **Kernel:** no advice at all.
+
+Measured with `examples/thp.rs` (64-byte boxed nodes linked in one random
+cycle; build time includes the page faults) on a Zen 5 Threadripper, kernel
+THP policy `always`, best of 3, pinned to one core:
+
+| nodes | build, Never | build, Auto | chase, Never | chase, Auto | RSS, Never | RSS, Auto |
+|---|---|---|---|---|---|---|
+| 1 MiB | 0.1 ms, 324 faults | 0.1 ms, 68 faults | 4.7 ns/hop | **2.6 ns/hop** | 3 MiB | 4 MiB |
+| 16 MiB | 2.5 ms, 4110 faults | **1.1 ms**, 525 faults | 10.6 ns/hop | **8.7 ns/hop** | 23 MiB | 25 MiB |
+| 256 MiB | 51.4 ms, 66213 faults | **24.8 ms**, 677 faults | 125.3 ns/hop | **113.9 ns/hop** | 339 MiB | 344 MiB |
+
+The cost is resident memory in 2 MiB steps. In `examples/request_mix.rs`
+(`LocalHeap`), RSS with huge pages vs `Never`: 4.0 vs 1.0 MiB with no survivors,
+6.1 vs 2.4 MiB at 5% survivors over 64 requests, 14.6 vs 11.6 MiB over 512.
+Time per request was unchanged; warm microbenchmarks (`cargo bench`) were also
+unchanged, because they reuse memory that is already faulted in.
+
+So huge pages win even for a 1 MiB working set (the L1 TLB covers only 384 KiB
+of 4 KiB pages), and the price is 1-3 MiB per heap. `Auto` therefore leaves
+small heaps to the deployment's kernel policy instead of refusing, and
+guarantees huge pages for big heaps even on `madvise` kernels (Ubuntu's
+default). Deployments with many small heaps and tight memory limits should use
+`Never`. Not measured: a kernel whose policy is `madvise` (no root on the test
+machine); there `Auto` below 16 MiB behaves like the `Never` column.
+
 ## Reap
 
 `heap.reap()` returns a `Reap`, a `Copy` handle that borrows only the heap.
@@ -139,8 +206,9 @@ byte accounting returns to zero.
 
 ## Roadmap
 
-1. **Phase 1 (this crate):** `LocalHeap`, `Arena` (on the OS or on a heap),
-   `Reap` and `StackArena`.
+1. **Phase 1 (this crate):** `LocalHeap` (with a huge-page policy, optionally
+   over a fixed region), `Arena` (on the OS or on a heap), `Reap` and
+   `StackArena`.
 2. **Phase 2:** optional glommio integration: a heap per executor, byte
    accounting per task queue feeding the scheduler, allocation sampling on the
    slow path.
