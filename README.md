@@ -94,6 +94,21 @@ faults) and random pointer chasing 10-45% faster from 1 MiB to 256 MiB working
 sets, for 1-3 MiB more resident memory per heap. Details in
 [DESIGN.md](DESIGN.md#huge-pages).
 
+## Returning memory
+
+Freed memory stays resident for reuse for one purge epoch (10 ms, longer while
+purged memory keeps being needed again soon after), then goes back to the OS,
+including free pages inside segments still in use. Housekeeping runs from the
+allocation slow path, so a heap that goes quiet needs a nudge: call
+`heap.maintain()` from an event loop's idle hook, or `heap.trim()` to return
+everything free at once.
+
+After freeing 90% of 256 MiB of small objects in runs that die together, then
+trimming (`cargo run --release --example fragmentation -- <allocator> clustered`):
+glibc keeps 37 MiB resident, mimalloc 54, LocalHeap 61 (0.2.0 kept 186). When
+survivors are scattered over every page, no size-class allocator can return
+much; see [DESIGN.md](DESIGN.md#fragmentation).
+
 ## Benchmarks: one lifetime profile at a time
 
 Median time per iteration through the same `Vec::new_in` / `Box::new_in` code
@@ -166,6 +181,7 @@ MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test
 cargo bench          # vs glibc, mimalloc, mimalloc first-class heaps, bumpalo
 cargo run --release --example request_mix -- reap 50 64   # allocator, survivors ‰, window
 cargo run --release --example thp -- auto                 # huge-page policy
+cargo run --release --example fragmentation -- heap clustered  # or glibc, mimalloc; random
 ```
 
 ## License

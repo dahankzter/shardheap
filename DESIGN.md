@@ -170,11 +170,78 @@ reduce the pinning; they would need sub-slot page descriptors.
   page. That page is kept for `RETIRE_DELAY` ticks so a workload crossing a page
   boundary does not thrash.
 - Cached large mappings idle for `PURGE_DELAY` ticks are unmapped.
-- An empty segment is cached (at most `MAX_CACHED_SEGMENTS`). After
-  `PURGE_DELAY` ticks its slots are `madvise(MADV_DONTNEED)`ed; the mapping and
-  header stay. Further empty segments are unmapped.
-- `trim()` releases everything idle now; `reset(&mut self)` frees all blocks at
-  once (an arena reset) and keeps a few segments mapped for reuse.
+- An empty segment is cached (at most `MAX_CACHED_SEGMENTS`); further empty
+  segments are unmapped.
+- **Free slots go back to the OS after a whole idle epoch,** in empty and partly
+  used segments alike (the mapping and header stay). Each segment keeps three
+  slot bitmaps: *dirty* (freed this epoch), *stale* (freed in an earlier epoch
+  and still free) and *purged*. At the end of an epoch, stale slots are
+  `madvise(MADV_DONTNEED)`ed and dirty ones become stale. Claiming a slot clears
+  it from all three, so a slot is purged only after being free for at least one
+  whole epoch.
+- **Epochs are wall time:** 10 ms, the order of mimalloc's purge delay, read
+  from `CLOCK_MONOTONIC_COARSE` (vDSO, no syscall) once per heartbeat. Counting
+  slow-path calls instead tied purging to the allocation rate: 1024 calls pass
+  in under a millisecond in a busy loop, and `batch_mixed` ran 2.1x slower,
+  refaulting memory it had purged moments earlier.
+- **Epochs adapt.** Claiming a purged slot is a refault: the purge saved nothing
+  and cost a page fault per 4 KiB. An epoch with a refault doubles the epoch
+  length, up to 64x (640 ms); four clean epochs in a row halve it. Halving after
+  a single clean epoch oscillated, because the epoch after a refault purges
+  nothing new and is always clean.
+- **Huge pages:** purging 64 KiB inside a 2 MiB page splits it, and `khugepaged`
+  collapses ranges with up to `max_ptes_none` (default 511 of 512) empty
+  entries again, refilling the hole with zeroes. So while segments ask for huge
+  pages (`Auto` past 16 MiB, `Always`), a segment in use is purged only when its
+  whole upper half is free; the lower half holds the header. Empty segments are
+  purged whole.
+- `maintain()` runs housekeeping on demand. It otherwise runs only from the
+  allocation slow path, so a heap that goes quiet would keep what it freed; an
+  event loop calls `maintain()` from its idle hook. `trim()` releases everything
+  free now, splitting huge pages if need be. `reset(&mut self)` frees all blocks
+  at once (an arena reset) and keeps a few segments mapped for reuse.
+
+### Fragmentation
+
+`examples/fragmentation.rs`:
+1. Fill 256 MiB with 16-1024 B objects.
+2. Free 90% of them. Under *random*, survivors are scattered over every page.
+   Under *clustered*, runs of 4096 consecutive allocations (about 2 MiB) die
+   together.
+3. Add 256 MiB of 2-8 KiB objects.
+4. Churn: 20 rounds, each replacing half of a 128 MiB live set with sizes from
+   a range that drifts every round.
+
+Figures are resident MiB above the baseline, with the best churn time of 3.
+Trim means `LocalHeap::trim`, `mi_collect(true)` or `malloc_trim(0)`. AMD
+Threadripper PRO 9975WX, THP `always`.
+
+| | glibc | mimalloc | LocalHeap 0.2.0 | LocalHeap `Auto` | LocalHeap `Never` |
+|---|---|---|---|---|---|
+| clustered, thinned to 33 MiB, then trim | 37 | 54 | 186 | 61 | 58 |
+| random, thinned to 26 MiB, then trim | 160 | 283 | 273 | 273 | 268 |
+| clustered, 289 MiB live after step 3 | 295 | 338 | 343 | 340 | 329 |
+| random, end of churn (128 MiB live) | 242 | 421 | 376 | 376 | 334 |
+| random, end of churn, then trim | 193 | 335 | 376 | 326 | 321 |
+| random, churn time | 678 ms | 237 ms | 240 ms | 237 ms | 267 ms |
+
+- **When data dies together, its memory now goes back.** 0.2.0 returned only
+  wholly empty segments, so after the clustered thinning it kept 186 MiB for
+  33 MiB live. It now keeps 61 MiB, close to mimalloc's 54.
+- **`Never` returns idle memory as it goes:** 376 to 334 MiB at the end of
+  churn without a trim. It pays 4-11% churn time (247 ms in 0.2.0, 256-267 ms
+  now, across runs), because purged slots fault back in when reused.
+- **`Auto` keeps huge pages whole.** It runs at full speed and returns the rest
+  on `trim`.
+- **Scattered survivors defeat size classes.** Every page keeps a survivor, so
+  neither mimalloc nor `LocalHeap` can return or reuse the space for other
+  sizes. glibc coalesces neighbouring free chunks, ends far more compact, and
+  runs churn 2.8x slower.
+
+Measurement caveat: `vec_growth_8MiB` swings 16% (248 against 294 µs) between
+builds that differ only in unrelated code. With
+`-C llvm-args=-align-loops=64`, both run at 247 µs: the swing is the alignment
+of the benchmark's push loop, not the heap.
 
 ## What Rust allows that C does not
 
@@ -209,9 +276,9 @@ byte accounting returns to zero.
 1. **Phase 1 (this crate):** `LocalHeap` (with a huge-page policy, optionally
    over a fixed region), `Arena` (on the OS or on a heap), `Reap` and
    `StackArena`.
-2. **Phase 2:** optional glommio integration: a heap per executor, byte
-   accounting per task queue feeding the scheduler, allocation sampling on the
-   slow path.
+2. **Phase 2:** optional glommio integration: a heap per executor,
+   `maintain()` from the reactor's idle path, byte accounting per task queue
+   feeding the scheduler, allocation sampling on the slow path.
 3. **Phase 3:** remote frees. `Page::_thread_free` and `Segment::_owner` are
    reserved. The candidate design is snmalloc-style message batching to the
    owner, rather than mimalloc's per-free atomic. This gives a `Send` heap handle,
@@ -221,8 +288,10 @@ byte accounting returns to zero.
 
 ## Known limits (phase 1)
 
-- Free slots inside a segment that is still partly in use are never purged;
-  only whole empty segments are.
-- Housekeeping is driven by slow-path calls, so a heap that stops allocating keeps
-  its cached memory until `trim()`.
+- Segregated size classes cannot reuse a hole for a block of another class.
+  When survivors are scattered over every page (`fragmentation random`), freed
+  memory stays resident until those pages empty, as with mimalloc; glibc
+  coalesces neighbouring free chunks and does better there.
+- Housekeeping runs from the allocation slow path and `maintain()`; a heap that
+  neither allocates nor is maintained keeps its free memory until `trim()`.
 - Linux only for real memory (`mmap`); elsewhere `os.rs` uses the global allocator.

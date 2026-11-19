@@ -60,10 +60,14 @@ pub(crate) struct Segment {
     pub(crate) prev: *mut Segment,
     /// Bit `i` set: slot `i` is in use. Bit 0 (the header) is always set.
     pub(crate) used_slots: u64,
-    /// Heap tick at which the segment last became empty.
-    pub(crate) idle_since: u64,
-    /// Whether the empty segment's slots have been returned to the OS.
-    pub(crate) purged: bool,
+    /// Free slots released in the current purge epoch; their memory may be
+    /// resident. A subset of the zero bits of `used_slots`.
+    pub(crate) dirty_slots: u64,
+    /// Free slots released in an earlier epoch and not yet purged: idle for at
+    /// least one whole epoch. Disjoint from `dirty_slots`.
+    pub(crate) stale_slots: u64,
+    /// Free slots returned to the OS by a purge while the segment was in use.
+    pub(crate) purged_slots: u64,
     /// Phase 3: identity of the owning heap.
     pub(crate) _owner: usize,
     pub(crate) pages: [Page; SLOTS],
@@ -111,6 +115,17 @@ pub(crate) fn span_mask(slot: usize, k: usize) -> u64 {
     bits << slot
 }
 
+/// Calls `f(first, n)` for every maximal run of set bits in `mask`.
+#[inline]
+pub(crate) fn for_each_run(mut mask: u64, mut f: impl FnMut(usize, usize)) {
+    while mask != 0 {
+        let first = mask.trailing_zeros() as usize;
+        let n = (!(mask >> first)).trailing_zeros() as usize;
+        f(first, n);
+        mask &= !span_mask(first, n);
+    }
+}
+
 /// Initializes a fresh, zeroed segment header.
 ///
 /// # Safety
@@ -142,5 +157,15 @@ mod tests {
         assert_eq!(find_span(!0 ^ (1 << 63), 2), None);
         assert_eq!(span_mask(3, 2), 0b11000);
         assert_eq!(span_mask(0, 64), !0);
+    }
+
+    #[test]
+    fn runs() {
+        let mut v = Vec::new();
+        for_each_run(0b1110_0110 | 1 << 63, |a, n| v.push((a, n)));
+        assert_eq!(v, [(1, 2), (5, 3), (63, 1)]);
+        v.clear();
+        for_each_run(!0, |a, n| v.push((a, n)));
+        assert_eq!(v, [(0, 64)]);
     }
 }

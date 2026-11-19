@@ -410,3 +410,72 @@ impl<T, I: Iterator<Item = T>> CollectIn<T> for I {
         v
     }
 }
+
+/// An idle heap returns memory through `maintain` once it has been free for
+/// whole purge epochs, without `trim`.
+#[cfg(all(target_os = "linux", not(miri)))]
+#[test]
+fn maintain_purges_idle_memory() {
+    fn resident(blocks: &[NonNull<u8>]) -> usize {
+        let mut v = [0u8; 1];
+        blocks
+            .iter()
+            .filter(|b| {
+                let page = b.as_ptr().map_addr(|a| a & !4095);
+                // SAFETY: a mapped page of the heap; `v` holds its one byte.
+                assert_eq!(
+                    unsafe { libc::mincore(page.cast(), 4096, v.as_mut_ptr()) },
+                    0
+                );
+                v[0] & 1 != 0
+            })
+            .count()
+    }
+    let heap = LocalHeap::with_huge_pages(HugePages::Never);
+    let l = Layout::new::<[u8; 4096]>();
+    let blocks: Vec<_> = (0..4096)
+        .map(|_| {
+            let b = heap.allocate(l).unwrap().cast::<u8>();
+            fill(b, l.size(), 7);
+            b
+        })
+        .collect();
+    // Keep every 64th block: no page empties into a whole free segment, but
+    // most pages do empty.
+    let (keep, free): (Vec<_>, Vec<_>) = blocks
+        .into_iter()
+        .enumerate()
+        .partition(|(i, _)| i % 64 == 0);
+    for &(_, b) in &free {
+        // SAFETY: allocated above with `l`.
+        unsafe { heap.deallocate(b, l) };
+    }
+    // Blocks sharing a 64 KiB slot with a kept block stay resident; the
+    // others are in pages that emptied. (4 KiB blocks: one-slot pages.)
+    let slot = |b: &NonNull<u8>| b.addr().get() >> 16;
+    let pinned: std::collections::HashSet<_> = keep.iter().map(|(_, b)| slot(b)).collect();
+    let free: Vec<_> = free
+        .into_iter()
+        .map(|(_, b)| b)
+        .filter(|b| !pinned.contains(&slot(b)))
+        .collect();
+    let before = resident(&free);
+    assert!(
+        before > free.len() / 2,
+        "freed memory is still resident: {before}"
+    );
+    for _ in 0..4 {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        heap.maintain();
+    }
+    let after = resident(&free);
+    assert!(
+        after < free.len() / 16,
+        "idle memory was purged: {before} -> {after}"
+    );
+    for (_, b) in keep {
+        check(b, l.size(), 7);
+        // SAFETY: allocated above with `l`.
+        unsafe { heap.deallocate(b, l) };
+    }
+}

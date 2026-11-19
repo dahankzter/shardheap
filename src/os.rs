@@ -95,6 +95,19 @@ mod imp {
         // SAFETY: caller guarantees the range is ours and unused.
         unsafe { libc::madvise(p.as_ptr().cast(), size, libc::MADV_DONTNEED) };
     }
+
+    /// Milliseconds on a monotonic clock. The coarse clock is read from the
+    /// vDSO without a syscall, in a few nanoseconds; its resolution (a few
+    /// milliseconds) is plenty for purge epochs.
+    pub(crate) fn now_ms() -> u64 {
+        let mut t = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: plain clock read into a local.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut t) };
+        t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000
+    }
 }
 
 #[cfg(not(all(target_os = "linux", not(miri))))]
@@ -120,9 +133,16 @@ mod imp {
     pub(crate) unsafe fn purge(_p: NonNull<u8>, _size: usize) {}
 
     pub(crate) unsafe fn advise_huge(_p: NonNull<u8>, _size: usize, _huge: bool) {}
+
+    pub(crate) fn now_ms() -> u64 {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        BASE.get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
 }
 
-pub(crate) use imp::{advise_huge, map_aligned, purge, remap, unmap};
+pub(crate) use imp::{advise_huge, map_aligned, now_ms, purge, remap, unmap};
 
 use core::alloc::{AllocError, Allocator, Layout};
 

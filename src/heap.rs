@@ -17,12 +17,23 @@ const MAX_CACHED_SEGMENTS: usize = 1;
 const MAX_RESET_SEGMENTS: usize = 4;
 /// Slow-path events between purge checks.
 const HEARTBEAT: u64 = 256;
-/// Slow-path events a cached empty segment stays resident before its memory is
-/// returned to the OS.
+/// Slow-path events a cached large mapping is kept before it is unmapped.
 const PURGE_DELAY: u64 = 1024;
 /// Slow-path events the last empty page of a class is kept before its slots go
 /// back to the segment.
 const RETIRE_DELAY: u64 = 256;
+/// Purge epoch for free slots of segments, in milliseconds: a slot free for a
+/// whole epoch is returned to the OS at its end; the mapping stays. Wall time rather
+/// than slow-path events, which pass in microseconds under heavy allocation.
+/// The same order as mimalloc's purge delay.
+const EPOCH_MS: u64 = 10;
+/// Longest purge epoch, as a power-of-two multiple of `EPOCH_MS`. The epoch doubles whenever purged slots are claimed again
+/// within it (the purge cost a refault and saved nothing) and halves after
+/// `CLEAN_EPOCHS` epochs in a row without that.
+const MAX_EPOCH_SHIFT: u32 = 6;
+/// See `MAX_EPOCH_SHIFT`. Halving after a single clean epoch oscillates: the
+/// epoch after a refault purges nothing new, so it is always clean.
+const CLEAN_EPOCHS: u32 = 4;
 /// Freed large mappings kept for reuse (page-aligned ones only).
 const LARGE_CACHE_SLOTS: usize = 8;
 /// Upper bound on the bytes held in the large-mapping cache.
@@ -99,6 +110,15 @@ pub struct Stats {
     pub region_bytes: usize,
 }
 
+/// The purge clock; unit tests freeze it to run epochs by hand.
+#[cfg(not(test))]
+use os::now_ms;
+#[cfg(test)]
+fn now_ms() -> u64 {
+    let _ = os::now_ms; // used outside tests
+    0
+}
+
 /// Header at the start of every large mapping. Large mappings form an intrusive
 /// list so [`LocalHeap::reset`] and `Drop` can release them.
 #[repr(C)]
@@ -123,6 +143,14 @@ pub(crate) struct Inner {
     large_cache: [CachedMap; LARGE_CACHE_SLOTS],
     large_cache_bytes: usize,
     tick: u64,
+    /// `os::now_ms` when the current purge epoch began; see `end_epoch`.
+    epoch_start: u64,
+    /// The purge epoch is `EPOCH_MS << epoch_shift` milliseconds.
+    epoch_shift: u32,
+    /// Whether purged slots were claimed again in the current epoch.
+    refaulted: bool,
+    /// Epochs in a row without a refault, up to `CLEAN_EPOCHS`.
+    clean_epochs: u32,
     pub(crate) stats: Stats,
     /// The reap's bump page, or null; see `reap.rs`.
     pub(crate) reap_page: *mut Page,
@@ -201,6 +229,10 @@ impl LocalHeap {
                 large_cache: [NO_MAP; LARGE_CACHE_SLOTS],
                 large_cache_bytes: 0,
                 tick: 0,
+                epoch_start: 0,
+                epoch_shift: 0,
+                refaulted: false,
+                clean_epochs: 0,
                 stats: Stats {
                     allocated_bytes: 0,
                     mapped_bytes: 0,
@@ -291,10 +323,27 @@ impl LocalHeap {
         unsafe { (*self.inner.get()).stats }
     }
 
-    /// Unmaps every empty segment now, instead of waiting for the purge delay.
+    /// Returns cached memory to the OS now, instead of waiting for the purge
+    /// delay: unmaps every empty segment and the large-mapping cache, and purges
+    /// the free slots of segments still in use (splitting huge pages if need be).
+    /// Region memory stays mapped and resident.
     pub fn trim(&self) {
         // SAFETY: see `inner`.
         unsafe { self.inner().trim() }
+    }
+
+    /// Runs the heap's housekeeping now, as the allocation slow path does from
+    /// time to time: memory free for a whole purge epoch (10 ms, longer while
+    /// purged memory keeps being reused soon after) goes back to the OS, and
+    /// counts as a burst of slow-path activity for the other delays.
+    ///
+    /// Housekeeping otherwise runs only while the heap allocates, so a heap that
+    /// goes quiet keeps what it freed. Call this when the thread goes idle, for
+    /// example from an event loop's idle hook. Unlike [`trim`](Self::trim), it
+    /// leaves recently freed memory resident for reuse.
+    pub fn maintain(&self) {
+        // SAFETY: see `inner`.
+        unsafe { self.inner().maintain() }
     }
 
     /// Frees everything at once, like an arena reset. Keeps a few segments mapped
@@ -459,9 +508,15 @@ impl Inner {
             };
             if (*seg).used_slots == 1 {
                 self.stats.empty_segments -= 1;
-                (*seg).purged = false;
             }
-            (*seg).used_slots |= segment::span_mask(slot, k);
+            let mask = segment::span_mask(slot, k);
+            (*seg).used_slots |= mask;
+            (*seg).dirty_slots &= !mask;
+            (*seg).stale_slots &= !mask;
+            if (*seg).purged_slots & mask != 0 {
+                self.refaulted = true;
+                (*seg).purged_slots &= !mask;
+            }
             let pages = (&raw mut (*seg).pages).cast::<Page>();
             for i in 0..k {
                 (*pages.add(slot + i)).head_offset = i as u8;
@@ -653,7 +708,12 @@ impl Inner {
             let slot = ((*page).start.addr() - seg.addr()) / SLOT_SIZE;
             let k = (*page).span as usize;
             ptr::write_bytes(page, 0, 1);
-            (*seg).used_slots &= !segment::span_mask(slot, k);
+            let mask = segment::span_mask(slot, k);
+            (*seg).used_slots &= !mask;
+            if !self.in_region(seg.cast()) {
+                // Region memory is pinned and never purged.
+                (*seg).dirty_slots |= mask;
+            }
             if (*seg).used_slots == 1 {
                 self.segment_became_empty(seg);
             }
@@ -663,7 +723,6 @@ impl Inner {
     unsafe fn segment_became_empty(&mut self, seg: *mut Segment) {
         // SAFETY: `seg` is a live, empty segment of this heap.
         unsafe {
-            (*seg).idle_since = self.tick;
             self.stats.empty_segments += 1;
             if self.stats.empty_segments > MAX_CACHED_SEGMENTS {
                 self.release_segment(seg);
@@ -742,26 +801,91 @@ impl Inner {
         }
     }
 
-    /// Releases long-idle kept pages, then returns the memory of long-idle empty
-    /// segments to the OS (the mapping stays).
+    unsafe fn maintain(&mut self) {
+        self.tick += HEARTBEAT;
+        // SAFETY: as `heartbeat`.
+        unsafe { self.purge_idle() }
+    }
+
+    /// Releases long-idle kept pages and cached large mappings, and ends the
+    /// purge epoch if it is over.
     unsafe fn purge_idle(&mut self) {
         // SAFETY: queues and the segment list hold live pages/segments of this heap.
         unsafe {
             self.release_kept_pages(RETIRE_DELAY);
             self.evict_large_cache(PURGE_DELAY);
+            let now = now_ms();
+            if now.wrapping_sub(self.epoch_start) >= EPOCH_MS << self.epoch_shift {
+                self.epoch_start = now;
+                self.end_epoch();
+            }
+        }
+    }
+
+    /// Ends a purge epoch: adapts its length, then purges the free slots that
+    /// were idle for all of it (in empty segments too: their mapping stays) and
+    /// marks those freed during it stale.
+    unsafe fn end_epoch(&mut self) {
+        if self.refaulted {
+            self.epoch_shift = (self.epoch_shift + 1).min(MAX_EPOCH_SHIFT);
+            self.clean_epochs = 0;
+        } else {
+            self.clean_epochs += 1;
+            if self.clean_epochs == CLEAN_EPOCHS {
+                self.epoch_shift = self.epoch_shift.saturating_sub(1);
+                self.clean_epochs = 0;
+            }
+        }
+        self.refaulted = false;
+        // SAFETY: the segment list holds live segments of this heap; dirty and
+        // stale slots are free and outside the region.
+        unsafe {
             let mut seg = self.segments;
             while !seg.is_null() {
-                if (*seg).used_slots == 1
-                    && !(*seg).purged
-                    && self.tick - (*seg).idle_since >= PURGE_DELAY
-                    && !self.in_region(seg.cast())
-                {
-                    let slots = NonNull::new_unchecked(seg.cast::<u8>().add(SLOT_SIZE));
-                    os::purge(slots, SEGMENT_SIZE - SLOT_SIZE);
-                    (*seg).purged = true;
-                }
+                let purged = self.purge_free(seg, (*seg).stale_slots, false);
+                (*seg).purged_slots |= purged;
+                (*seg).stale_slots = ((*seg).stale_slots & !purged) | (*seg).dirty_slots;
+                (*seg).dirty_slots = 0;
                 seg = (*seg).next;
             }
+        }
+    }
+
+    /// Returns free slots among `candidates` of a segment to the OS and returns
+    /// the mask purged. With huge pages, a partial purge of a segment in use
+    /// would split a 2 MiB page (and `khugepaged` may fill the hole again when it
+    /// collapses the range), so unless `split` allows that, only a wholly free
+    /// upper half is purged; the lower half holds the header. An empty segment
+    /// is purged whole: only its header is still in use.
+    ///
+    /// # Safety
+    /// `seg` is a live segment of this heap; `candidates` are free slots of it,
+    /// outside the region.
+    unsafe fn purge_free(&mut self, seg: *mut Segment, candidates: u64, split: bool) -> u64 {
+        const UPPER: u64 = !0 << (segment::SLOTS / 2);
+        // SAFETY: caller's contract; free slots hold nothing.
+        unsafe {
+            let purge = if split || (*seg).used_slots == 1 || !self.segments_huge() {
+                candidates
+            } else if (*seg).used_slots & UPPER == 0 && candidates & UPPER != 0 {
+                UPPER
+            } else {
+                0
+            };
+            segment::for_each_run(purge, |first, n| {
+                let p = NonNull::new_unchecked(seg.cast::<u8>().add(first * SLOT_SIZE));
+                os::purge(p, n * SLOT_SIZE);
+            });
+            purge
+        }
+    }
+
+    /// Whether segments are (or may be made of) huge pages by this heap's advice.
+    fn segments_huge(&self) -> bool {
+        match self.huge_pages {
+            HugePages::Auto => self.huge_now,
+            HugePages::Always => true,
+            HugePages::Never | HugePages::Kernel => false,
         }
     }
 
@@ -795,6 +919,13 @@ impl Inner {
                 let next = (*seg).next;
                 if (*seg).used_slots == 1 {
                     self.release_segment(seg);
+                } else {
+                    let free = (*seg).dirty_slots | (*seg).stale_slots;
+                    // Not recorded in `purged_slots`: reuse after an explicit trim
+                    // says nothing about the purge epoch.
+                    let purged = self.purge_free(seg, free, true);
+                    (*seg).dirty_slots &= !purged;
+                    (*seg).stale_slots &= !purged;
                 }
                 seg = next;
             }
@@ -814,8 +945,10 @@ impl Inner {
                 if kept < MAX_RESET_SEGMENTS {
                     if (*seg).used_slots != 1 {
                         ptr::write_bytes(&raw mut (*seg).pages, 0, 1);
+                        if !self.in_region(seg.cast()) {
+                            (*seg).dirty_slots |= (*seg).used_slots & !1;
+                        }
                         (*seg).used_slots = 1;
-                        (*seg).idle_since = self.tick;
                         self.stats.empty_segments += 1;
                     }
                     kept += 1;
@@ -1192,5 +1325,143 @@ unsafe impl Allocator for LocalHeap {
     ) -> Result<NonNull<[u8]>, AllocError> {
         // SAFETY: caller's contract; see `inner`.
         unsafe { self.inner().resize(ptr.as_ptr(), old, new) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const L: Layout = Layout::new::<[u8; 1024]>();
+
+    /// A heap with four pages of 1 KiB blocks (the fourth keeps a page of the
+    /// class in the queue, so emptied pages are released at once), and the
+    /// blocks of the second page freed. Returns the heap, the live blocks and
+    /// the slot mask of the freed page.
+    fn heap_with_a_free_page() -> (LocalHeap, Vec<NonNull<u8>>, *mut Segment, u64) {
+        let heap = LocalHeap::with_huge_pages(HugePages::Never);
+        let c = class::class_for(L).unwrap();
+        let per_page = class::capacity(c);
+        let mut blocks: Vec<_> = (0..3 * per_page + 1)
+            .map(|i| {
+                let p = heap.allocate(L).unwrap().cast::<u8>();
+                // SAFETY: fresh block of 1 KiB.
+                unsafe { p.as_ptr().write_bytes(i as u8, L.size()) };
+                p
+            })
+            .collect();
+        let seg = segment::segment_of(blocks[0].as_ptr());
+        let slot = (blocks[per_page].addr().get() - seg.addr()) / SLOT_SIZE;
+        let mask = segment::span_mask(slot, class::span_slots(c));
+        for b in blocks.drain(per_page..2 * per_page) {
+            // SAFETY: allocated above with `L`.
+            unsafe { heap.deallocate(b, L) };
+        }
+        (heap, blocks, seg, mask)
+    }
+
+    fn end_epoch(heap: &LocalHeap) {
+        // SAFETY: no other reference to the inner heap is live.
+        unsafe { heap.inner().end_epoch() }
+    }
+
+    fn slots(seg: *mut Segment) -> (u64, u64, u64) {
+        // SAFETY: a live segment of the test's heap.
+        unsafe { ((*seg).dirty_slots, (*seg).stale_slots, (*seg).purged_slots) }
+    }
+
+    fn epoch_shift(heap: &LocalHeap) -> u32 {
+        // SAFETY: no other reference to the inner heap is live.
+        unsafe { heap.inner().epoch_shift }
+    }
+
+    #[test]
+    fn free_slots_are_purged_after_a_whole_idle_epoch() {
+        let (heap, blocks, seg, mask) = heap_with_a_free_page();
+        assert_eq!(slots(seg), (mask, 0, 0), "released slots start dirty");
+        end_epoch(&heap);
+        assert_eq!(slots(seg), (0, mask, 0), "then stale for one epoch");
+        end_epoch(&heap);
+        assert_eq!(slots(seg), (0, 0, mask), "then purged");
+        assert_eq!(epoch_shift(&heap), 0);
+
+        // Claiming the purged slots again is a refault: the epoch doubles, then
+        // shrinks back after an epoch without one.
+        let again: Vec<_> = (0..class::capacity(class::class_for(L).unwrap()))
+            .map(|_| heap.allocate(L).unwrap().cast::<u8>())
+            .collect();
+        assert_eq!(slots(seg), (0, 0, 0));
+        end_epoch(&heap);
+        assert_eq!(epoch_shift(&heap), 1);
+        for _ in 1..CLEAN_EPOCHS {
+            end_epoch(&heap);
+            assert_eq!(epoch_shift(&heap), 1, "one clean epoch is not enough");
+        }
+        end_epoch(&heap);
+        assert_eq!(epoch_shift(&heap), 0);
+
+        for b in blocks.into_iter().chain(again) {
+            // SAFETY: allocated with `L`.
+            unsafe { heap.deallocate(b, L) };
+        }
+    }
+
+    #[test]
+    fn claimed_slots_leave_every_set() {
+        let (heap, blocks, seg, mask) = heap_with_a_free_page();
+        end_epoch(&heap);
+        assert_eq!(slots(seg), (0, mask, 0));
+        // The fourth page takes all but one; the rest needs a new page, which
+        // takes the lowest free slots: the freed page's.
+        let again: Vec<_> = (0..class::capacity(class::class_for(L).unwrap()))
+            .map(|_| heap.allocate(L).unwrap().cast::<u8>())
+            .collect();
+        assert_eq!(slots(seg), (0, 0, 0), "the free page's slots were claimed");
+        assert!(
+            // SAFETY: no other reference to the inner heap is live.
+            !unsafe { heap.inner().refaulted },
+            "stale slots were still resident"
+        );
+        for b in blocks.into_iter().chain(again) {
+            // SAFETY: allocated with `L`.
+            unsafe { heap.deallocate(b, L) };
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn trim_returns_free_slots_of_a_segment_in_use() {
+        fn resident_pages(p: *mut u8, len: usize) -> usize {
+            let mut v = vec![0u8; len / PAGE];
+            // SAFETY: a mapped, page-aligned range; `v` has one byte per page.
+            assert_eq!(unsafe { libc::mincore(p.cast(), len, v.as_mut_ptr()) }, 0);
+            v.iter().filter(|&&b| b & 1 != 0).count()
+        }
+        let (heap, blocks, seg, mask) = heap_with_a_free_page();
+        let first = mask.trailing_zeros() as usize;
+        let n = mask.count_ones() as usize;
+        // SAFETY: slots of the live segment.
+        let free = unsafe { seg.cast::<u8>().add(first * SLOT_SIZE) };
+        assert!(resident_pages(free, n * SLOT_SIZE) > 0);
+        heap.trim();
+        assert_eq!(heap.stats().segments, 1, "the segment stays mapped");
+        assert_eq!(resident_pages(free, n * SLOT_SIZE), 0, "free slots purged");
+        assert_eq!(
+            slots(seg),
+            (0, 0, 0),
+            "an explicit trim is not a purge epoch"
+        );
+        let per_page = class::capacity(class::class_for(L).unwrap());
+        for (i, b) in blocks.into_iter().enumerate() {
+            let tag = if i < per_page { i } else { i + per_page } as u8;
+            // SAFETY: a live block of 1 KiB.
+            let s = unsafe { core::slice::from_raw_parts(b.as_ptr(), L.size()) };
+            assert!(
+                s.iter().all(|&x| x == tag),
+                "live blocks keep their contents"
+            );
+            // SAFETY: allocated with `L`.
+            unsafe { heap.deallocate(b, L) };
+        }
     }
 }
