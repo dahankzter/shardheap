@@ -9,6 +9,7 @@ use core::ptr::{self, NonNull};
 use crate::class::{self, NUM_CLASSES};
 use crate::os::{self, PAGE};
 use crate::region::Region;
+use crate::remote::{Link, Msg};
 use crate::segment::{self, Block, MAGIC, Page, SEGMENT_SIZE, SLOT_SIZE, Segment};
 
 /// Empty segments kept mapped for reuse; further empty segments are unmapped.
@@ -128,7 +129,9 @@ struct LargeHeader {
     map_size: usize,
     map_align: usize,
     /// As `Segment::owner`.
-    owner: usize,
+    owner: *mut (),
+    /// Link word while the block travels as a remote-free message.
+    remote_next: *mut u8,
 }
 
 /// Pops a block from `page`'s `free` list, swapping in `local_free` when it is
@@ -146,10 +149,158 @@ unsafe fn pop_free(page: *mut Page) -> *mut Block {
             b = ptr::replace(&raw mut (*page).local_free, ptr::null_mut());
         }
         if !b.is_null() {
-            (*page).free = (*b).next;
+            let n = (*b).next;
+            prefetch(n.cast());
+            (*page).free = n;
             (*page).used += 1;
         }
         b
+    }
+}
+
+/// Starts loading the line at `p` for writing: the next block to hand out,
+/// whose line another thread may hold since it freed the block. Never faults.
+#[inline(always)]
+fn prefetch(p: *const u8) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: a prefetch is a hint; it never faults, whatever `p` is.
+    unsafe {
+        core::arch::asm!("prefetchw [{}]", in(reg) p, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+    let _ = p;
+}
+
+/// Tag bit of a large block's message: the header address with this bit set
+/// (headers are page-aligned; small blocks are at least word-aligned, so the bit
+/// is free in both).
+pub(crate) const LARGE_MSG: usize = 1;
+
+/// The message for the small block at `p`: the block itself, linked through
+/// its first word.
+///
+/// # Safety
+/// `p` is a live small block.
+#[inline(always)]
+pub(crate) unsafe fn small_msg(p: *mut u8) -> Msg {
+    p
+}
+
+/// Tag bit of a group message: several small blocks of one page, sent as one.
+/// Blocks are 16-aligned, so the bit is free.
+pub(crate) const GROUP_MSG: usize = 2;
+
+/// Tag bit of a carrier message: a small block holding a list of other small
+/// blocks of the same heap, sent as one. The sender writes only the carrier;
+/// the listed blocks' lines stay where they are until their owner reuses them.
+pub(crate) const CARRIER_MSG: usize = 4;
+
+/// Tag bits a message may carry.
+const MSG_TAGS: usize = LARGE_MSG | GROUP_MSG | CARRIER_MSG;
+
+/// Words of a carrier before its list: the link, the count.
+const CARRIER_HEADER: usize = 2;
+
+/// How many blocks a carrier of `bytes` bytes (at most its block size) lists.
+#[inline(always)]
+pub(crate) fn carrier_capacity(bytes: usize) -> usize {
+    (bytes / size_of::<usize>()).saturating_sub(CARRIER_HEADER)
+}
+
+/// The `i`th entry of the list in carrier `c`.
+///
+/// # Safety
+/// `c` is a small block owned by the caller, with `i < carrier_capacity` of
+/// its size.
+#[inline(always)]
+pub(crate) unsafe fn carrier_slot(c: *mut u8, i: usize) -> *mut *mut u8 {
+    // SAFETY: caller's contract: inside the block.
+    unsafe { c.cast::<*mut u8>().add(CARRIER_HEADER + i) }
+}
+
+/// The message for carrier `c` listing `count` blocks (`carrier_slot`): small,
+/// untagged messages for blocks of the heap that owns `c`.
+///
+/// # Safety
+/// As `carrier_slot`; entries `0..count` are written.
+#[inline]
+pub(crate) unsafe fn carrier_msg(c: *mut u8, count: usize) -> Msg {
+    // SAFETY: caller's contract: the count word is inside the block.
+    unsafe { *c.cast::<usize>().add(1) = count };
+    c.map_addr(|a| a | CARRIER_MSG)
+}
+
+/// The batching key of a small message: blocks with equal keys lie in one
+/// slot, hence one page, and may travel as one group (`group_msg`). `None` for
+/// a large message.
+///
+/// # Safety
+/// `m` is an untagged small message or a large message.
+#[inline(always)]
+pub(crate) unsafe fn group_key(m: Msg) -> Option<usize> {
+    (m.addr() & LARGE_MSG == 0).then(|| m.addr() / segment::SLOT_SIZE)
+}
+
+/// The message for `count` small blocks of one page chained from `first` to
+/// `last` through their first words (`last`'s is free): `last`, carrying the
+/// count and the offset back to `first` in its second word, so the owner
+/// splices the whole chain into the page touching `last`'s line only.
+/// A chain of one is a plain small message.
+///
+/// # Safety
+/// The blocks are live, owned by the caller, and share one `group_key`;
+/// `1 <= count`, and `count == 1` exactly when `first == last`.
+#[inline]
+pub(crate) unsafe fn group_msg(first: *mut u8, last: *mut u8, count: usize) -> Msg {
+    if count == 1 {
+        return last;
+    }
+    // Within one 64 KiB slot: the offset fits in 16 signed bits counted in
+    // 16-byte units, the count (at most 4096 blocks) in the 16 bits above.
+    let units = ((first.addr() as isize - last.addr() as isize) / 16) as i16;
+    let meta = (count << 16) | units as u16 as usize;
+    // SAFETY: caller's contract: `last` is at least 16 bytes, its second word
+    // is free.
+    unsafe { *last.cast::<usize>().add(1) = meta };
+    last.map_addr(|a| a | GROUP_MSG)
+}
+
+/// The message for the large block at `p`, allocated with alignment `align`:
+/// its header, tagged, linked through `LargeHeader::remote_next`.
+///
+/// # Safety
+/// `p` is a live large block allocated with alignment `align`.
+#[inline(always)]
+pub(crate) unsafe fn large_msg(p: *mut u8, align: usize) -> Msg {
+    // SAFETY: caller's contract; the header sits `large_offset` before the data.
+    unsafe { p.sub(large_offset(align)).map_addr(|a| a | LARGE_MSG) }
+}
+
+/// The link word of a message: a small block's first word, a large header's
+/// `remote_next`.
+pub(crate) struct MsgLink;
+
+impl MsgLink {
+    #[inline(always)]
+    fn word(m: Msg) -> *mut *mut u8 {
+        if m.addr() & LARGE_MSG != 0 {
+            let h = m.map_addr(|a| a & !LARGE_MSG).cast::<LargeHeader>();
+            // SAFETY: no dereference; a field address inside the header.
+            unsafe { &raw mut (*h).remote_next }
+        } else {
+            m.map_addr(|a| a & !MSG_TAGS).cast()
+        }
+    }
+}
+
+impl Link for MsgLink {
+    unsafe fn next(m: Msg) -> Msg {
+        // SAFETY: caller's contract: `m` is a live message.
+        unsafe { *Self::word(m) }
+    }
+    unsafe fn set_next(m: Msg, next: Msg) {
+        // SAFETY: caller's contract: `m` is a live message owned by the caller.
+        unsafe { *Self::word(m) = next }
     }
 }
 
@@ -158,17 +309,17 @@ unsafe fn pop_free(page: *mut Page) -> *mut Block {
 /// # Safety
 /// `p` is a live large block allocated with alignment `align`.
 #[inline(always)]
-unsafe fn large_owner(p: *mut u8, align: usize) -> usize {
+unsafe fn large_owner(p: *mut u8, align: usize) -> *mut () {
     // SAFETY: caller's contract; the header sits `large_offset` before the data.
     unsafe { (*p.sub(large_offset(align)).cast::<LargeHeader>()).owner }
 }
 
-/// A block reached the wrong heap. Stage A has no remote frees, and safe code
-/// cannot get here (`ShardAlloc` is `!Send`), so this is memory corruption or
-/// misuse of unsafe code: stop before the heap is damaged.
+/// A block reached a heap that cannot take it: a `LocalHeap` block freed
+/// through `ShardAlloc`. Safe code cannot get here, so this is memory
+/// corruption or misuse of unsafe code: stop before a heap is damaged.
 #[cold]
 #[inline(never)]
-fn foreign_free() -> ! {
+pub(crate) fn foreign_free() -> ! {
     eprintln!("shardheap: block freed on a thread that does not own it");
     std::process::abort()
 }
@@ -208,12 +359,15 @@ pub(crate) struct Inner {
     /// Memory to take segments and large blocks from before the OS.
     region: Option<Region>,
     /// For a thread heap (`ShardAlloc`), this heap's own address, which never
-    /// changes; 0 for an explicit heap. Stamped into every segment and large
+    /// changes; null for an explicit heap. Stamped into every segment and large
     /// header.
-    pub(crate) owner: usize,
-    /// Set when a thread heap's thread has exited: the free that empties the
-    /// heap afterwards (from a later thread-local destructor) trims it.
-    pub(crate) exited: bool,
+    pub(crate) owner: *mut (),
+    /// A thread heap's remote-free mail: sends its batches and drains its
+    /// inbox, returning whether that freed any block. Called on every heartbeat
+    /// that runs housekeeping, and before a size class takes a fresh page, so
+    /// blocks freed elsewhere are reused while still warm. `None` for explicit
+    /// heaps; only those two rare paths look at it.
+    pub(crate) mail: Option<unsafe fn(&mut Inner) -> bool>,
 }
 
 /// A shared-nothing heap: one per thread (or executor), no atomics, no locks.
@@ -440,8 +594,8 @@ impl Inner {
             huge_pages,
             huge_now: false,
             region: None,
-            owner: 0,
-            exited: false,
+            owner: ptr::null_mut(),
+            mail: None,
         }
     }
 
@@ -535,10 +689,15 @@ impl Inner {
         self.heartbeat();
         // SAFETY: every page reached through the queue is a live page of this heap.
         unsafe {
+            let mut mail = self.mail;
             loop {
                 let page = self.queues[c];
                 if page.is_null() {
-                    break;
+                    // Out of pages: collect remote frees before fresh memory.
+                    match mail.take() {
+                        Some(f) if f(self) => continue,
+                        _ => break,
+                    }
                 }
                 if let Some(b) = self.take_block(page) {
                     return Ok(b);
@@ -627,7 +786,6 @@ impl Inner {
             ptr::write_bytes(page, 0, 1);
             (*page).start = seg.cast::<u8>().add(slot * SLOT_SIZE);
             (*page).span = k as u8;
-            (*page).owner = self.owner;
             Ok(page)
         }
     }
@@ -758,33 +916,41 @@ impl Inner {
 
     /// `dealloc` for a heap reached without proof of ownership (`ShardAlloc`).
     /// A thread heap's owner stamp is its own address, so the check compares the
-    /// block's stamp with `this` before touching `this`: `ShardAlloc`'s empty
-    /// heap (a thread without a heap yet), which stamps nothing, or another
-    /// heap's address aborts.
+    /// block's stamp with `this` before touching `this`. A block of another heap
+    /// (or any block, if `this` is an empty heap that owns nothing) goes to
+    /// `foreign(owner, message)` instead, as a remote-free message.
     ///
     /// # Safety
     /// As `dealloc`, except that the block may belong to another heap; `this` is
     /// a live heap whose `owner` is its own address, or a heap that owns nothing.
     #[inline(always)]
-    pub(crate) unsafe fn dealloc_owned(this: *mut Inner, p: *mut u8, layout: Layout) {
+    pub(crate) unsafe fn dealloc_owned(
+        this: *mut Inner,
+        p: *mut u8,
+        layout: Layout,
+        foreign: impl FnOnce(*mut (), Msg),
+    ) {
         if layout.size() == 0 {
             return;
         }
         // SAFETY: caller's contract: `p` is a live block allocated with `layout`
-        // by some heap, so its segment or large header is readable; `this` is
-        // dereferenced only once it matches the block's (nonzero) owner stamp.
+        // by some heap, so its page or large header is readable; `this` is
+        // dereferenced only once it matches the block's owner stamp.
         unsafe {
             match class::class_for(layout) {
                 Some(c) => {
-                    let page = segment::page_of(segment::segment_of(p), p);
-                    if (*page).owner != this.addr() {
-                        foreign_free();
+                    // The segment header's stamp: a line the owner rarely writes,
+                    // unlike the page descriptor (its free list and counts).
+                    let owner = (*segment::segment_of(p)).owner;
+                    if owner != this.cast() {
+                        return foreign(owner, small_msg(p));
                     }
                     (*this).free_small(p, c);
                 }
                 None => {
-                    if large_owner(p, layout.align()) != this.addr() {
-                        foreign_free();
+                    let owner = large_owner(p, layout.align());
+                    if owner != this.cast() {
+                        return foreign(owner, large_msg(p, layout.align()));
                     }
                     (*this).free_large(p, layout);
                 }
@@ -792,29 +958,18 @@ impl Inner {
         }
     }
 
-    /// `resize` with the owner check of `dealloc_owned` on `(p, old)`.
+    /// The owner stamp of the live block at `p`, allocated with `layout`, and its
+    /// remote-free message.
     ///
     /// # Safety
-    /// As `resize` and `dealloc_owned`, and `this` is a live heap (not the empty
-    /// one), with no other reference in use.
-    pub(crate) unsafe fn resize_owned(
-        this: *mut Inner,
-        p: *mut u8,
-        old: Layout,
-        new: Layout,
-    ) -> Result<NonNull<[u8]>, AllocError> {
-        // SAFETY: as `dealloc_owned`.
+    /// `p` is a live block of some heap, allocated with nonzero `layout`.
+    pub(crate) unsafe fn owner_of(p: *mut u8, layout: Layout) -> (*mut (), Msg) {
+        // SAFETY: caller's contract.
         unsafe {
-            if old.size() != 0 {
-                let owner = match class::class_for(old) {
-                    Some(_) => (*segment::page_of(segment::segment_of(p), p)).owner,
-                    None => large_owner(p, old.align()),
-                };
-                if owner != this.addr() {
-                    foreign_free();
-                }
+            match class::class_for(layout) {
+                Some(_) => ((*segment::segment_of(p)).owner, small_msg(p)),
+                None => (large_owner(p, layout.align()), large_msg(p, layout.align())),
             }
-            (*this).resize(p, old, new)
         }
     }
 
@@ -843,6 +998,18 @@ impl Inner {
                 "deallocated with a different layout"
             );
             let _ = c;
+            self.free_block(page, p);
+        }
+    }
+
+    /// Frees `p` into its page: `free_small` once the page is known.
+    ///
+    /// # Safety
+    /// `p` is a live small block of this heap, in `page`.
+    #[inline(always)]
+    unsafe fn free_block(&mut self, page: *mut Page, p: *mut u8) {
+        // SAFETY: caller's contract.
+        unsafe {
             let b = p.cast::<Block>();
             (*b).next = (*page).local_free;
             (*page).local_free = b;
@@ -852,6 +1019,95 @@ impl Inner {
                 self.free_small_slow(page);
             }
         }
+    }
+
+    /// Frees one message sent by another thread, as a local free: the page and
+    /// class of a small block come from its segment, the size and alignment of
+    /// a large one from its header.
+    ///
+    /// # Safety
+    /// `m` is a message (`small_msg`/`large_msg`) for a live block of this heap,
+    /// no longer used by anyone.
+    pub(crate) unsafe fn free_msg(&mut self, m: Msg) {
+        // SAFETY: caller's contract.
+        unsafe {
+            if m.addr() & LARGE_MSG != 0 {
+                self.free_large_header(m.map_addr(|a| a & !LARGE_MSG).cast());
+            } else if m.addr() & GROUP_MSG != 0 {
+                self.free_group(m.map_addr(|a| a & !GROUP_MSG));
+            } else if m.addr() & CARRIER_MSG != 0 {
+                self.free_carrier(m.map_addr(|a| a & !CARRIER_MSG));
+            } else {
+                let page = segment::page_of(segment::segment_of(m), m);
+                self.free_block(page, m);
+            }
+        }
+    }
+
+    /// Frees a carrier (`carrier_msg`): every block it lists, then itself. The
+    /// listed blocks' lines are requested all at once first, so their misses
+    /// overlap.
+    ///
+    /// # Safety
+    /// As `free_msg`; `c` is an untagged carrier message.
+    unsafe fn free_carrier(&mut self, c: *mut u8) {
+        // SAFETY: caller's contract: `c` lists `count` live blocks of this
+        // heap; the list is read before `c` itself is freed.
+        unsafe {
+            let count = *c.cast::<usize>().add(1);
+            for i in 0..count {
+                prefetch(*carrier_slot(c, i));
+            }
+            for i in 0..count {
+                let p = *carrier_slot(c, i);
+                self.free_block(segment::page_of(segment::segment_of(p), p), p);
+            }
+            self.free_block(segment::page_of(segment::segment_of(c), c), c);
+        }
+    }
+
+    /// Frees a group message's chain (`group_msg`) in one splice: `last`'s
+    /// first word takes the page's local free list, the chain's first block
+    /// becomes its head.
+    ///
+    /// # Safety
+    /// As `free_msg`; `last` is an untagged group message.
+    unsafe fn free_group(&mut self, last: *mut u8) {
+        // SAFETY: caller's contract: `last` heads a well-formed chain of
+        // `count` blocks of one page of this heap.
+        unsafe {
+            let meta = *last.cast::<usize>().add(1);
+            let count = meta >> 16;
+            let first = last.wrapping_offset(meta as u16 as i16 as isize * 16);
+            let page = segment::page_of(segment::segment_of(last), last);
+            (*last.cast::<Block>()).next = (*page).local_free;
+            (*page).local_free = first.cast();
+            (*page).used -= count as u32;
+            self.stats.allocated_bytes -= count * (*page).block_size;
+            if !(*page).in_queue || (*page).used == 0 {
+                self.free_small_slow(page);
+            }
+        }
+    }
+
+    /// Frees up to `limit` messages along the list at `m` (linked through
+    /// `MsgLink`) and returns the rest, null when it is all freed.
+    ///
+    /// # Safety
+    /// Every message of the list is as for `free_msg`.
+    pub(crate) unsafe fn free_msgs(&mut self, mut m: Msg, limit: usize) -> Msg {
+        let mut n = 0;
+        while !m.is_null() && n < limit {
+            // SAFETY: caller's contract; the link is read before the free
+            // overwrites it.
+            unsafe {
+                let next = MsgLink::next(m);
+                self.free_msg(m);
+                m = next;
+            }
+            n += 1;
+        }
+        m
     }
 
     #[cold]
@@ -864,18 +1120,7 @@ impl Inner {
             }
             if (*page).used == 0 {
                 self.retire(page);
-                self.trim_if_exited();
             }
-        }
-    }
-
-    /// After the owning thread exited, the free that leaves nothing allocated
-    /// returns everything to the OS. Called only from free slow paths.
-    #[inline]
-    fn trim_if_exited(&mut self) {
-        if self.exited && self.stats.allocated_bytes == 0 {
-            // SAFETY: nothing is allocated, so nothing references the memory.
-            unsafe { self.trim() }
         }
     }
 
@@ -994,8 +1239,14 @@ impl Inner {
     pub(crate) fn heartbeat(&mut self) {
         self.tick += 1;
         if self.tick.is_multiple_of(HEARTBEAT) {
-            // SAFETY: walks only this heap's live segments.
-            unsafe { self.purge_idle() }
+            // SAFETY: walks only this heap's live segments; `mail` is set only
+            // by `ShardAlloc` for its own thread heaps.
+            unsafe {
+                self.purge_idle();
+                if let Some(f) = self.mail {
+                    f(self);
+                }
+            }
         }
     }
 
@@ -1103,6 +1354,18 @@ impl Inner {
                     self.release_page(page);
                 }
             }
+        }
+    }
+
+    /// What an empty heap keeps for the thread that adopts it: its pages back
+    /// in their segments (so at most one empty segment stays mapped) and
+    /// nothing else; cached large mappings and the reap page are released.
+    pub(crate) unsafe fn keep_warm(&mut self) {
+        // SAFETY: as `trim`.
+        unsafe {
+            self.release_kept_pages(0);
+            self.release_idle_reap_page();
+            self.evict_large_cache(0);
         }
     }
 
@@ -1229,6 +1492,7 @@ impl Inner {
                 map_size,
                 map_align,
                 owner: self.owner,
+                remote_next: ptr::null_mut(),
             });
             if !self.large.is_null() {
                 (*self.large).prev = h;
@@ -1320,8 +1584,16 @@ impl Inner {
 
     unsafe fn free_large(&mut self, p: *mut u8, layout: Layout) {
         // SAFETY: `p` was returned by `alloc_large` (or `grow_large`) with this alignment.
+        unsafe { self.free_large_header(p.sub(large_offset(layout.align())).cast()) }
+    }
+
+    /// Frees the large mapping whose header is `h`.
+    ///
+    /// # Safety
+    /// `h` heads a live large mapping of this heap that nothing uses any more.
+    unsafe fn free_large_header(&mut self, h: *mut LargeHeader) {
+        // SAFETY: caller's contract.
         unsafe {
-            let h = p.sub(large_offset(layout.align())).cast::<LargeHeader>();
             self.unlink_large(h);
             let (size, align) = ((*h).map_size, (*h).map_align);
             self.stats.large_allocations -= 1;
@@ -1330,7 +1602,6 @@ impl Inner {
                 self.stats.mapped_bytes -= size;
                 self.unmap(NonNull::new_unchecked(h.cast()), size, align);
             }
-            self.trim_if_exited();
         }
     }
 
@@ -1615,14 +1886,11 @@ mod tests {
     }
 
     /// The owner stamp of the block at `p`, allocated with `l`.
-    fn owner_of(p: NonNull<u8>, l: Layout) -> usize {
+    fn owner_of(p: NonNull<u8>, l: Layout) -> *mut () {
         // SAFETY: a live block of a heap, allocated with `l`.
         unsafe {
             if class::class_for(l).is_some() {
-                let seg = segment::segment_of(p.as_ptr());
-                let page_owner = (*segment::page_of(seg, p.as_ptr())).owner;
-                assert_eq!(page_owner, (*seg).owner, "page and segment stamps agree");
-                page_owner
+                (*segment::segment_of(p.as_ptr())).owner
             } else {
                 (*p.as_ptr()
                     .sub(large_offset(l.align()))
@@ -1635,12 +1903,12 @@ mod tests {
     const OWNER_LAYOUTS: [(usize, usize); 3] = [(64, 8), (1 << 20, 8), (300_000, 1 << 16)];
 
     #[test]
-    fn explicit_heaps_stamp_owner_zero() {
+    fn explicit_heaps_stamp_no_owner() {
         let heap = LocalHeap::new();
         for (size, align) in OWNER_LAYOUTS {
             let l = Layout::from_size_align(size, align).unwrap();
             let p = heap.allocate(l).unwrap().cast::<u8>();
-            assert_eq!(owner_of(p, l), 0);
+            assert!(owner_of(p, l).is_null());
             // SAFETY: allocated above with `l`.
             unsafe { heap.deallocate(p, l) };
         }
@@ -1652,18 +1920,167 @@ mod tests {
         let this = heap.inner.get();
         // SAFETY: no other reference to the inner heap is live; the heap does
         // not move during the test, as a thread heap never moves.
-        unsafe { (*this).owner = this.addr() };
+        unsafe { (*this).owner = this.cast() };
         for (size, align) in OWNER_LAYOUTS {
             let l = Layout::from_size_align(size, align).unwrap();
             let p = heap.allocate(l).unwrap().cast::<u8>();
-            assert_eq!(owner_of(p, l), this.addr());
-            let big = Layout::from_size_align(size * 2, align).unwrap();
+            assert_eq!(owner_of(p, l), this.cast());
             // SAFETY: `p` is live with `l`; no other reference to the inner heap.
+            assert_eq!(unsafe { Inner::owner_of(p.as_ptr(), l) }.0, this.cast());
+            let big = Layout::from_size_align(size * 2, align).unwrap();
+            // SAFETY: as above.
             unsafe {
-                let q = Inner::resize_owned(this, p.as_ptr(), l, big).unwrap();
-                assert_eq!(owner_of(q.cast(), big), this.addr());
-                Inner::dealloc_owned(this, q.as_ptr().cast(), big);
+                let q = (*this).resize(p.as_ptr(), l, big).unwrap();
+                assert_eq!(owner_of(q.cast(), big), this.cast());
+                Inner::dealloc_owned(this, q.as_ptr().cast(), big, |_, _| {
+                    panic!("an own block is not foreign")
+                });
             }
+        }
+        assert_eq!(heap.stats().allocated_bytes, 0);
+    }
+
+    /// Turns live blocks into one message list, linked through `MsgLink`.
+    fn message_list(blocks: &[(NonNull<u8>, Layout)]) -> Msg {
+        let msgs: Vec<Msg> = blocks
+            .iter()
+            .map(|&(p, l)| {
+                // SAFETY: live blocks of the test's heap.
+                unsafe {
+                    if class::class_for(l).is_some() {
+                        small_msg(p.as_ptr())
+                    } else {
+                        large_msg(p.as_ptr(), l.align())
+                    }
+                }
+            })
+            .collect();
+        for w in msgs.windows(2) {
+            // SAFETY: each message is owned here.
+            unsafe { <MsgLink as crate::remote::Link>::set_next(w[0], w[1]) };
+        }
+        // SAFETY: as above.
+        unsafe {
+            <MsgLink as crate::remote::Link>::set_next(*msgs.last().unwrap(), ptr::null_mut())
+        };
+        msgs[0]
+    }
+
+    #[test]
+    fn messages_free_like_local_frees() {
+        let heap = LocalHeap::new();
+        let mut blocks = Vec::new();
+        for i in 0..300 {
+            let l = Layout::from_size_align(8 + (i * 37) % 2000, 8).unwrap();
+            blocks.push((heap.allocate(l).unwrap().cast::<u8>(), l));
+        }
+        for (size, align) in [(1 << 20, 8), (300_000, 1 << 16)] {
+            let l = Layout::from_size_align(size, align).unwrap();
+            blocks.push((heap.allocate(l).unwrap().cast::<u8>(), l));
+        }
+        let list = message_list(&blocks);
+        // SAFETY: the list holds live blocks of this heap; nothing else uses them.
+        unsafe {
+            let rest = heap.inner().free_msgs(list, 256);
+            assert!(!rest.is_null(), "bounded: 302 messages, 256 freed");
+            assert!(heap.stats().allocated_bytes > 0);
+            assert!(heap.inner().free_msgs(rest, 256).is_null());
+        }
+        let s = heap.stats();
+        assert_eq!((s.allocated_bytes, s.large_allocations), (0, 0));
+    }
+
+    #[test]
+    fn freed_message_blocks_are_reused() {
+        let heap = LocalHeap::new();
+        let l = Layout::new::<[u8; 64]>();
+        let keep = heap.allocate(l).unwrap(); // keeps the page in use
+        let p = heap.allocate(l).unwrap().cast::<u8>();
+        // SAFETY: `p` is a live block of this heap.
+        unsafe { heap.inner().free_msg(small_msg(p.as_ptr())) };
+        assert_eq!(heap.allocate(l).unwrap().cast::<u8>(), p);
+        // SAFETY: allocated above with `l`.
+        unsafe {
+            heap.deallocate(p, l);
+            heap.deallocate(keep.cast(), l);
+        }
+    }
+
+    #[test]
+    fn a_carrier_message_frees_every_block_it_lists() {
+        let heap = LocalHeap::new();
+        let l = Layout::new::<[u8; 1024]>();
+        let keep = heap.allocate(l).unwrap(); // keeps the page in use
+        let c = heap.allocate(l).unwrap().cast::<u8>().as_ptr();
+        let listed: Vec<*mut u8> = (0..8)
+            .map(|_| heap.allocate(l).unwrap().cast::<u8>().as_ptr())
+            .collect();
+        assert!(carrier_capacity(l.size()) >= listed.len());
+        // SAFETY: the blocks are live blocks of this heap, owned here; `c`
+        // has room for the list.
+        unsafe {
+            for (i, &p) in listed.iter().enumerate() {
+                *carrier_slot(c, i) = p;
+            }
+            let m = carrier_msg(c, listed.len());
+            <MsgLink as crate::remote::Link>::set_next(m, ptr::null_mut());
+            assert!(heap.inner().free_msgs(m, 1).is_null(), "one message");
+        }
+        assert_eq!(heap.stats().allocated_bytes, l.size());
+        let mut again: Vec<*mut u8> = (0..9)
+            .map(|_| heap.allocate(l).unwrap().cast::<u8>().as_ptr())
+            .collect();
+        let mut want = listed.clone();
+        want.push(c);
+        again.sort();
+        want.sort();
+        assert_eq!(again, want, "the carrier and its listed blocks are reused");
+        // SAFETY: allocated above with `l`.
+        unsafe {
+            for b in again {
+                heap.deallocate(NonNull::new(b).unwrap(), l);
+            }
+            heap.deallocate(keep.cast(), l);
+        }
+        assert_eq!(heap.stats().allocated_bytes, 0);
+    }
+
+    #[test]
+    fn a_group_message_frees_its_whole_chain() {
+        let heap = LocalHeap::new();
+        let l = Layout::new::<[u8; 1024]>();
+        let keep = heap.allocate(l).unwrap(); // keeps the page in use
+        let blocks: Vec<*mut u8> = (0..8)
+            .map(|_| heap.allocate(l).unwrap().cast::<u8>().as_ptr())
+            .collect();
+        // SAFETY: live small blocks of this heap.
+        let key = |b| unsafe { group_key(small_msg(b)) };
+        assert!(key(blocks[0]).is_some());
+        assert!(blocks.iter().all(|&b| key(b) == key(blocks[0])));
+        // SAFETY: the blocks are owned here; the chain runs from `blocks[7]`
+        // down to `blocks[0]`, linked through their first words.
+        unsafe {
+            for w in blocks.windows(2) {
+                *w[1].cast::<*mut u8>() = w[0];
+            }
+            let m = group_msg(blocks[7], blocks[0], 8);
+            <MsgLink as crate::remote::Link>::set_next(m, ptr::null_mut());
+            assert!(heap.inner().free_msgs(m, 1).is_null(), "one message");
+        }
+        assert_eq!(heap.stats().allocated_bytes, l.size());
+        let mut again: Vec<*mut u8> = (0..8)
+            .map(|_| heap.allocate(l).unwrap().cast::<u8>().as_ptr())
+            .collect();
+        let mut want = blocks.clone();
+        again.sort();
+        want.sort();
+        assert_eq!(again, want, "the chain's blocks are reused");
+        // SAFETY: allocated above with `l`.
+        unsafe {
+            for b in again {
+                heap.deallocate(NonNull::new(b).unwrap(), l);
+            }
+            heap.deallocate(keep.cast(), l);
         }
         assert_eq!(heap.stats().allocated_bytes, 0);
     }

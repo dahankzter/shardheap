@@ -2,3 +2,4 @@
 /target-bench
 /target-miri
 /target-bench-aligned
+/target-loom

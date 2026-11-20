@@ -51,3 +51,14 @@ jobs:
       - run: cargo miri test --lib --tests
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
+
+  loom:
+    name: Loom (remote frees)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --lib remote
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: 3

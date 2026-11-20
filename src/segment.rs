@@ -49,12 +49,6 @@ pub(crate) struct Page {
     pub(crate) in_queue: bool,
     /// Heap tick at which the page last became empty while kept for reuse.
     pub(crate) idle_since: u64,
-    /// The segment's `owner`, copied into each page: the owner check on free
-    /// reads it from the descriptor the free touches anyway. Reading it from the
-    /// segment header instead put a load at offset 0x38 of a 4 MiB-aligned
-    /// address, which 4K-aliases with stores to the first block of every page
-    /// and stalled `lifo_64B` by 30%.
-    pub(crate) owner: usize,
 }
 
 #[repr(C)]
@@ -73,8 +67,13 @@ pub(crate) struct Segment {
     /// Free slots returned to the OS by a purge while the segment was in use.
     pub(crate) purged_slots: u64,
     /// Address of the owning thread record (`ShardAlloc`), or 0 for a segment
-    /// of an explicit heap.
-    pub(crate) owner: usize,
+    /// of an explicit heap. The owner check on free reads it here, not from
+    /// the page descriptor: another thread's free then touches no line the
+    /// owner writes on every allocation (a cross-L3 miss per remote free).
+    /// A load here once 4K-aliased with stores to page-start blocks and
+    /// stalled `lifo_64B` by 30%; re-measured in stage B, it no longer does
+    /// (24.8 µs either way).
+    pub(crate) owner: *mut (),
     pub(crate) pages: [Page; SLOTS],
 }
 

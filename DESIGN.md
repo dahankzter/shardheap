@@ -257,21 +257,22 @@ behind `GlobalAlloc`.
 - **Lookup.** A const `thread_local!` `Cell` holds the current record: one
   thread-local load, with a null check whose out-of-line branch makes the
   record on first use.
-- **Owner stamps.** Every segment header, page descriptor and large-mapping
-  header holds the address of its owning heap (0 for explicit heaps); a
-  record's heap is its first field, so that is the record's address and the
-  thread-local's value. `ShardAlloc`'s free computes the class from the
-  `Layout` once, reads the stamp (the page descriptor for small blocks,
-  `p - large_offset(align)` for large ones) and compares it with the
-  thread-local value, before touching the heap: a thread with no record (null)
-  never matches. A mismatch aborts: in stage A, `ShardAlloc` is `!Send`, so
-  only misused unsafe code can get there. Stage B turns that branch into
-  batching to the owner. `LocalHeap` keeps its unchecked free.
-- **Exit.** A destructor registered on first use trims the record when the
-  thread exits: a heap with no live blocks ends with nothing mapped, one with
-  live blocks keeps them. The record stays the thread's, so other thread-locals'
-  destructors that run later can still allocate and free through it; it is
-  marked exited, and the free that leaves it empty trims it.
+- **Owner stamps.** Every segment header and large-mapping header holds the
+  address of its owning heap (0 for explicit heaps); a record's heap is its
+  first field, so that is the record's address and the thread-local's value.
+  `ShardAlloc`'s free computes the class from the `Layout` once, reads the
+  stamp (the segment header for small blocks, `p - large_offset(align)` for
+  large ones) and compares it with the thread-local value, before touching the
+  heap: a thread with no record (null) never matches. A mismatch sends the
+  block to its owner ([below](#frees-from-other-threads)); a stamp of 0 (a
+  `LocalHeap` block freed through `ShardAlloc`) aborts. `LocalHeap` keeps its
+  unchecked free.
+- **Exit.** A destructor registered on first use sends the thread's pending
+  batches, drains its inbox and parks the record in a pool. Other threads
+  keep sending to a parked record; a thread that starts later adopts one
+  (preferring a warm one, below) instead of making a new record. Other
+  thread-locals' destructors that run after the exit allocate from a parked
+  record under the pool lock.
 
 - **Empty heap.** Before its first allocation, a thread's `CURRENT` points
   at a static, read-only empty heap whose queues are all null (mimalloc's
@@ -290,10 +291,15 @@ interleaved rounds per allocator in one binary:
 
 | | mimalloc | `&LocalHeap` | `ShardAlloc` |
 |---|---|---|---|
-| `lifo_64B` | 24.5-25.5 | 23.5-23.7 | 25.2 |
-| `batch_mixed` | 117-121 | 62.9-63.8 | 85.3-86.4 |
-| `vec_growth_8MiB` | 318-323 | 248-249 | 248-250 |
-| `tree_32k_nodes` | 248-251 | 225-229 | 228-232 |
+| `lifo_64B` | 24.7-26.5 | 22.7-22.9 | 24.4-26.3 |
+| `batch_mixed` | 117-122 | 62.0-62.8 | 83.9-84.4 |
+| `vec_growth_8MiB` | 317-323 | 247-252 | 247-250 |
+| `tree_32k_nodes` | 245-251 | 222-227 | 225-229 |
+
+(Stage B build. `batch_mixed` on `&LocalHeap` runs at 82 µs in about 4 of 10
+processes: the benchmark replays one fixed sequence of sizes, the branch
+predictor memorises it or not depending on where ASLR puts the code, and the
+slow processes show ten times the branch misses with identical machine code.)
 
 `ShardAlloc` ties mimalloc on `lifo_64B` (inside mimalloc's run-to-run
 spread) and beats it on the other three. What it pays over `&LocalHeap` on
@@ -306,6 +312,7 @@ and the owner compare: the floor of the design. How it got there, `lifo_64B`:
 | owner read moved from the segment header to the page descriptor | 29.1 |
 | record moved off the page start (`RECORD_OFFSET`) | 27.4 |
 | empty heap instead of a null check | 25.2 |
+| stage B: owner read back in the segment header (the page descriptor's line is written on every allocation, so a remote free there missed on it) | 24.8 |
 
 The first two steps removed false 4K aliases: each put a load at the same low
 12 address bits as the previous iteration's stores to the hot block, which sits
@@ -316,6 +323,99 @@ of a page (2.5G stalls, 6.6M after the move). The empty heap removed the last
 branch: the loop runs at about 5.9 instructions per cycle, so every instruction
 shows. Freeing through a page pointer computed once was slower (26.5) and was
 dropped.
+
+## Frees from other threads
+
+A block freed on a thread that does not own it is a *message* to its owner,
+built from the block itself, so sending allocates nothing:
+
+- **Small block:** the block, linked through its first word.
+- **Large block:** its mapping header, tagged with bit 0.
+- **Group** (bit 1): consecutive frees of blocks of one 64 KiB slot (one page),
+  chained through their first words; the last block carries the count and the
+  offset to the first. The owner splices the whole chain into the page's free
+  list touching one line.
+- **Carrier** (bit 2): a freed block of 256 bytes or more that lists other
+  freed blocks of the same owner. The freeing thread writes only the carrier,
+  not each block: a block's line goes back to its owner once, when the owner
+  reuses it, instead of to the freeing thread and back. The owner prefetches
+  every listed block, then frees them.
+
+Each thread keeps a *batch cache*: eight destinations, least recently used
+evicted, with an open group and an open carrier per destination. Past 16 KiB
+held, it sends every batch: one compare-and-swap pushes a whole list onto the
+owner's inbox, a lock-free stack in a cache line of its own. Sending checks the
+owner's state afterwards (sequentially consistent on both sides): if the owner
+had parked, the sender frees the batch itself under the pool lock. The Loom
+tests in `remote.rs` check that handshake.
+
+The owner drains its inbox on its allocation slow path: on the heartbeat, and
+before it takes a fresh page for a class whose queue is empty, so memory sent
+back is reused before new memory is touched. A drain frees at most 256
+messages; the rest waits for the next.
+
+Exited threads' records are parked in a pool. Up to eight parked heaps that
+have emptied stay *warm*, keeping one segment each: a thread that starts later
+adopts one and reuses memory that is already faulted in. Beyond that, an
+emptied parked heap gives everything back. A parked heap with live blocks keeps
+its memory as it is: trimming it purged pages that the blocks still sent home
+then faulted in again.
+
+### Results across threads
+
+`cargo bench --bench cross` measures one producer (`producer_consumer`) or four
+(`many_to_one`) sending filled buffers to one consumer that frees them, over a
+spinning ring (`benches/common/ring.rs`). A blocking channel put a consumer
+that kept up to sleep, and its futex wake-ups dominated the timings: with
+`std::sync::mpsc`, a faster allocator could lose.
+
+Pinned (consumer on CPU 2; producers on the same L3 or on other L3 domains of
+the Threadripper's four), median µs, best of two rounds, ratio to mimalloc:
+
+| case | size | mimalloc | **ShardAlloc** | snmalloc |
+|---|---|---|---|---|
+| producer_consumer, same L3 | 64 B | 4483 | **1493 (0.33)** | 1312 (0.29) |
+| | 1 KiB | 3098 | **1398 (0.45)** | 783 (0.25) |
+| | 16 KiB | 410 | **406 (0.99)** | 623 (1.52) |
+| | 64 KiB | 336 | **304 (0.91)** | 332 (0.99) |
+| producer_consumer, across L3 | 64 B | 18984 | **6155 (0.32)** | 4351 (0.23) |
+| | 1 KiB | 15194 | **4055 (0.27)** | 4592 (0.30) |
+| | 16 KiB | 1433 | **1045 (0.73)** | 1148 (0.80) |
+| | 64 KiB | 557 | **463 (0.83)** | 512 (0.92) |
+| many_to_one, same L3 | 64 B | 6000 | **5278 (0.88)** | 5856 (0.98) |
+| | 1 KiB | 3815 | **3348 (0.88)** | 3665 (0.96) |
+| | 16 KiB | 203 | **183 (0.90)** | 657 (3.24) |
+| | 64 KiB | 89 | **95 (1.06)** | 164 (1.83) |
+| many_to_one, across L3 | 64 B | 28031 | **24931 (0.89)** | 24952 (0.89) |
+| | 1 KiB | 21056 | **17603 (0.84)** | 17520 (0.83) |
+| | 16 KiB | 1243 | **1186 (0.95)** | 1274 (1.02) |
+| | 64 KiB | 303 | **302 (1.00)** | 298 (0.98) |
+
+On producer_consumer at 1 KiB on one L3, the allocator work is now the same as
+snmalloc's (about 50 cycles per free, 6 per allocation, against its 54 and
+6.5); the rest of the gap is the two threads contending on the ring, which
+stays full when the consumer is the slower side.
+
+What moved the numbers, each found with `perf`:
+
+- **Drain only on the heartbeat** left sent-back memory unused while the owner
+  took fresh pages; draining before a fresh page fixed it.
+- **The owner read one cross-L3 line per freed block** to follow the message
+  list (82% of drain time on one load): groups and carriers.
+- **A store that misses before a locked instruction stalls it:** writing a
+  group's first block only when the batch was sent made the send's
+  compare-and-swap wait for that miss (283 against 234 µs on many_to_one at
+  16 KiB, with identical send and retry counts). The block is written when the
+  group opens.
+- **Exit trimmed every heap,** so each new thread mapped and faulted in fresh
+  segments: warm parked heaps.
+
+Tried and dropped: a minimum number of blocks per batch (holding big blocks
+back made the producer touch cold memory, up to 27% slower), reusing a group's
+blocks newest first (faster at 1 KiB across L3, slower at 16 KiB), one inbox
+per sender (every benchmarked inbox has one sender, and compare-and-swap
+retries were 1%), and an `xchg`-based queue (locked like compare-and-swap, so
+it stalls the same way).
 
 ## What Rust allows that C does not
 
@@ -358,9 +458,10 @@ byte accounting returns to zero.
    - **Stage A (done):** thread heaps and `ShardAlloc` on one thread, with the
      owner stamps and the check a global allocator pays; it ties mimalloc on
      `lifo_64B` and beats it on the other three benchmarks.
-   - **Stage B:** snmalloc-style batches of remote frees sent to the owner's
-     inbox (one atomic per batch, not per free), exited threads' heaps parked
-     in a pool, `ShardAlloc` becomes `Send + Sync`; checked with Loom.
+   - **Stage B (done):** remote frees batched to the owner's inbox (one
+     atomic per batch), with group and carrier messages; exited threads' heaps
+     parked in a pool and adopted, warm ones first; `ShardAlloc` is
+     `Send + Sync`; the handshake checked with Loom.
 4. **Phase 4:** `GlobalAlloc` over `ShardAlloc`: allocation before the
    thread-local exists, re-entrancy, `fork`.
 

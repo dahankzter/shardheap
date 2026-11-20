@@ -21,6 +21,12 @@ libmimalloc-sys = { version = "0.1", features = ["extended"] }
 bumpalo = { version = "3", features = ["allocator-api2"] }
 allocator-api2 = { version = "0.2", default-features = false }
 
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(alloc_mimalloc)'] }
+
 [[bench]]
 name = "alloc"
 harness = false
@@ -28,3 +34,7 @@ harness = false
 [profile.bench]
 codegen-units = 1
 debug = true
+
+[[bench]]
+name = "cross"
+harness = false

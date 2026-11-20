@@ -38,10 +38,12 @@
 //!
 //! - [`ShardAlloc`] is a zero-sized handle for the current thread's own heap,
 //!   made on first use: the shape of a global allocator, paying a thread-local
-//!   lookup to allocate and an owner check to free.
+//!   lookup to allocate and an owner check to free. It is `Send + Sync`: a
+//!   block freed on another thread is batched there and sent home to the heap
+//!   that made it.
 //!
-//! Everything is single-threaded for now: every handle is `!Send`. Remote frees
-//! (a `Send` `ShardAlloc`) are the next stage. See `DESIGN.md`.
+//! `LocalHeap` and the arenas are `!Send`; `ShardAlloc` is the way to share
+//! collections between threads. See `DESIGN.md`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -52,7 +54,9 @@ mod heap;
 mod os;
 mod reap;
 mod region;
+mod remote;
 mod segment;
+#[cfg(not(loom))]
 mod shard;
 mod stack;
 
@@ -60,5 +64,6 @@ pub use arena::{Arena, ArenaStats};
 pub use heap::{HugePages, LocalHeap, Stats};
 pub use os::Os;
 pub use reap::Reap;
+#[cfg(not(loom))]
 pub use shard::ShardAlloc;
 pub use stack::StackArena;

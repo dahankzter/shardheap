@@ -133,8 +133,34 @@ The arenas win by doing almost nothing: allocation is an aligned pointer bump an
 freeing is free. That only works when objects die together; `LocalHeap` is the
 general-purpose heap that reuses memory block by block.
 
-Single-threaded only: these numbers say nothing yet about cross-thread frees
-(phase 3) or about use as a global allocator (phase 4).
+These are single-thread numbers; frees from other threads are below, use as a
+global allocator (phase 4) is not implemented yet.
+
+## Across threads: allocated on one thread, freed on another
+
+`cargo bench --bench cross`: producers allocate filled `Vec<u8, A>`s and send
+them over a bounded ring to one consumer that drops them. `producer_consumer`
+has one producer, `many_to_one` four. Median time per iteration (about 64 MiB of
+buffers), threads unpinned, ratio to mimalloc in brackets:
+
+| | glibc | mimalloc | **ShardAlloc** |
+|---|---|---|---|
+| producer_consumer, 64 B | 29.0 ms | 14.1 ms | **4.37 ms (0.31)** |
+| producer_consumer, 1 KiB | 19.1 ms | 10.7 ms | **3.53 ms (0.33)** |
+| producer_consumer, 16 KiB | 3.06 ms | 1.46 ms | **1.10 ms (0.75)** |
+| producer_consumer, 64 KiB | 1.25 ms | 507 µs | **540 µs (1.07)** |
+| many_to_one, 64 B | 22.0 ms | 15.4 ms | **13.0 ms (0.84)** |
+| many_to_one, 1 KiB | 17.4 ms | 13.8 ms | **13.2 ms (0.95)** |
+| many_to_one, 16 KiB | 2.32 ms | 1.04 ms | **1.08 ms (1.03)** |
+| many_to_one, 64 KiB | 519 µs | 290 µs | **304 µs (1.05)** |
+
+A freed block becomes a message to the heap that made it. The freeing thread
+batches messages per destination and sends each batch with one
+compare-and-swap; blocks of one page travel as one chain, and blocks of 256
+bytes or more travel listed in one of them, so the freeing thread writes one
+block per batch instead of each. With threads pinned, `ShardAlloc` is within 6%
+of mimalloc or faster in every case, and ahead of snmalloc in most; see
+[DESIGN.md](DESIGN.md#frees-from-other-threads).
 
 ## Mixed lifetimes: most objects die with their request, a few survive
 
@@ -172,9 +198,9 @@ and resident memory at the end (best of 3 runs, one process per allocator). Abou
 Phase 1 of a larger plan; [DESIGN.md](DESIGN.md) covers the layout, fast paths,
 how memory goes back to the OS, the unsafe surface, and the roadmap.
 
-- **Single-threaded for now.** Handles are `!Send`. `ShardAlloc` gives each
-  thread its own heap; sending its collections across threads (phase 3, stage B)
-  and use as `#[global_allocator]` (phase 4) are not implemented.
+- **`LocalHeap` and the arenas are `!Send`.** `ShardAlloc` gives each thread
+  its own heap and is `Send + Sync`: its collections can be freed on any
+  thread. Use as `#[global_allocator]` (phase 4) is not implemented yet.
 - **Rust 1.100 or newer:** the `Allocator` trait was stabilized there.
 - **Linux** gets `mmap`, `mremap` and `madvise`. Other platforms, and Miri, take
   memory from the global allocator instead.
@@ -185,7 +211,9 @@ how memory goes back to the OS, the unsafe surface, and the roadmap.
 ```
 cargo test
 MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test
+LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS='--cfg loom' cargo test --release --lib remote
 cargo bench          # vs glibc, mimalloc, mimalloc first-class heaps, bumpalo
+cargo bench --bench cross   # frees on another thread
 cargo run --release --example request_mix -- reap 50 64   # allocator, survivors ‰, window
 cargo run --release --example thp -- auto                 # huge-page policy
 cargo run --release --example fragmentation -- heap clustered  # or glibc, mimalloc; random
