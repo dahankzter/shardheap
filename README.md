@@ -133,8 +133,8 @@ The arenas win by doing almost nothing: allocation is an aligned pointer bump an
 freeing is free. That only works when objects die together; `LocalHeap` is the
 general-purpose heap that reuses memory block by block.
 
-These are single-thread numbers; frees from other threads are below, use as a
-global allocator (phase 4) is not implemented yet.
+These are single-thread numbers; frees from other threads, and whole programs
+on shardheap as their global allocator, are below.
 
 ## Across threads: allocated on one thread, freed on another
 
@@ -161,6 +161,39 @@ bytes or more travel listed in one of them, so the freeing thread writes one
 block per batch instead of each. With threads pinned, `ShardAlloc` is within 6%
 of mimalloc or faster in every case, and ahead of snmalloc in most; see
 [DESIGN.md](DESIGN.md#frees-from-other-threads).
+
+## As the global allocator, or `malloc` for any program
+
+```rust
+#[global_allocator]
+static A: shardheap::ShardAlloc = shardheap::ShardAlloc::new();
+```
+
+`malloc/` builds `libshardheap_malloc.so`, the C allocation API over the same
+heaps, for `LD_PRELOAD` (nightly, for one flag; see
+[malloc/README.md](malloc/README.md)). With it, mimalloc-bench's benchmarks
+run on shardheap. First results, time relative to mimalloc 1.8.2 (median of
+three runs, 64 threads where a benchmark takes a count; the full table, with
+memory, is in [DESIGN.md](DESIGN.md#mimalloc-bench)):
+
+| | glibc | jemalloc | tcmalloc | snmalloc | **shardheap** |
+|---|---|---|---|---|---|
+| cfrac | 0.99 | 1.01 | 1.00 | 0.99 | 1.13 |
+| espresso | 1.10 | 1.02 | 0.98 | 0.98 | 1.04 |
+| barnes | 1.02 | 0.99 | 1.02 | 1.02 | 1.01 |
+| alloc-test, 1 thread | 1.17 | 1.06 | 1.00 | 1.01 | 1.39 |
+| larson, 64 threads | 1.61 | 1.17 | 1.36 | 1.05 | 1.47 |
+| sh8bench, 128 threads | 37.6 | 1.68 | 23.9 | 0.97 | 4.21 |
+| xmalloc-test, 64 threads | 2.61 | 0.64 | 748 | 0.89 | **0.91** |
+| mstress, 64 threads | 1.32 | 1.03 | 1.33 | 0.98 | 1.79 |
+| rptest, 64 threads | 1.60 | 1.70 | 6.02 | 0.77 | 1.12 |
+| glibc-simple | 2.39 | 1.32 | 1.04 | 0.99 | 1.29 |
+
+This is a first run, before any tuning for these workloads: shardheap is
+behind mimalloc and snmalloc on most of them, ahead of glibc almost
+everywhere, and close to jemalloc. The single-threaded C programs show the
+cost of the C path (a `free` without a size looks the block up); the
+threaded stress tests show where batching remote frees has more to give.
 
 ## Mixed lifetimes: most objects die with their request, a few survive
 
@@ -200,20 +233,23 @@ how memory goes back to the OS, the unsafe surface, and the roadmap.
 
 - **`LocalHeap` and the arenas are `!Send`.** `ShardAlloc` gives each thread
   its own heap and is `Send + Sync`: its collections can be freed on any
-  thread. Use as `#[global_allocator]` (phase 4) is not implemented yet.
+  thread. It also works as `#[global_allocator]`, and as `malloc` through
+  `malloc/`.
 - **Rust 1.100 or newer:** the `Allocator` trait was stabilized there.
 - **Linux** gets `mmap`, `mremap` and `madvise`. Other platforms, and Miri, take
-  memory from the global allocator instead.
+  memory from the system allocator instead.
 - Experimental: the API may change, and it has not run in production.
 
 ## Checking
 
 ```
 cargo test
-MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test
+MIRIFLAGS=-Zmiri-permissive-provenance cargo +nightly miri test --lib --test cross --test model
+MIRIFLAGS='-Zmiri-permissive-provenance -Zmiri-tree-borrows' cargo +nightly miri test --test global
 LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS='--cfg loom' cargo test --release --lib remote
 cargo bench          # vs glibc, mimalloc, mimalloc first-class heaps, bumpalo
 cargo bench --bench cross   # frees on another thread
+malloc/tests/run.sh         # the C library, preloaded into C, C++ and everyday programs
 cargo run --release --example request_mix -- reap 50 64   # allocator, survivors ‰, window
 cargo run --release --example thp -- auto                 # huge-page policy
 cargo run --release --example fragmentation -- heap clustered  # or glibc, mimalloc; random

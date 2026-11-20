@@ -10,6 +10,7 @@ use crate::class::{self, NUM_CLASSES};
 use crate::os::{self, PAGE};
 use crate::region::Region;
 use crate::remote::{Link, Msg};
+use crate::segmap;
 use crate::segment::{self, Block, MAGIC, Page, SEGMENT_SIZE, SLOT_SIZE, Segment};
 
 /// Empty segments kept mapped for reuse; further empty segments are unmapped.
@@ -123,7 +124,7 @@ fn now_ms() -> u64 {
 /// Header at the start of every large mapping. Large mappings form an intrusive
 /// list so [`LocalHeap::reset`] and `Drop` can release them.
 #[repr(C)]
-struct LargeHeader {
+pub(crate) struct LargeHeader {
     next: *mut LargeHeader,
     prev: *mut LargeHeader,
     map_size: usize,
@@ -149,6 +150,10 @@ unsafe fn pop_free(page: *mut Page) -> *mut Block {
             b = ptr::replace(&raw mut (*page).local_free, ptr::null_mut());
         }
         if !b.is_null() {
+            // The free list holds pointers as they were freed, with whatever
+            // provenance their last user's references narrowed them to; the
+            // block handed out carries the page's (the segment's) instead.
+            b = page.cast::<Block>().with_addr(b.addr());
             let n = (*b).next;
             prefetch(n.cast());
             (*page).free = n;
@@ -184,6 +189,19 @@ pub(crate) const LARGE_MSG: usize = 1;
 #[inline(always)]
 pub(crate) unsafe fn small_msg(p: *mut u8) -> Msg {
     p
+}
+
+/// The small block at `p` with its segment's provenance instead of its
+/// caller's, for a block handed back to a caller (an in-place resize). A
+/// pointer a global allocator receives comes from std's references, narrowed
+/// to the value they held (one byte for a `Box<u8>`), and the caller's new use
+/// needs the whole block. A block being freed is written through the caller's
+/// own pointer instead: during the free, the caller's tag is protected, and a
+/// write through any other provenance would invalidate it (undefined behaviour
+/// under both Stacked and Tree Borrows).
+#[inline(always)]
+pub(crate) fn own_small(p: *mut u8) -> *mut u8 {
+    segment::segment_of(p).cast::<u8>().with_addr(p.addr())
 }
 
 /// Tag bit of a group message: several small blocks of one page, sent as one.
@@ -265,15 +283,15 @@ pub(crate) unsafe fn group_msg(first: *mut u8, last: *mut u8, count: usize) -> M
     last.map_addr(|a| a | GROUP_MSG)
 }
 
-/// The message for the large block at `p`, allocated with alignment `align`:
-/// its header, tagged, linked through `LargeHeader::remote_next`.
+/// The message for the large block at `p`: its header, tagged, linked through
+/// `LargeHeader::remote_next`.
 ///
 /// # Safety
-/// `p` is a live large block allocated with alignment `align`.
+/// `p` is a live large block.
 #[inline(always)]
-pub(crate) unsafe fn large_msg(p: *mut u8, align: usize) -> Msg {
-    // SAFETY: caller's contract; the header sits `large_offset` before the data.
-    unsafe { p.sub(large_offset(align)).map_addr(|a| a | LARGE_MSG) }
+pub(crate) unsafe fn large_msg(p: *mut u8) -> Msg {
+    // SAFETY: caller's contract.
+    unsafe { large_header(p).cast::<u8>().map_addr(|a| a | LARGE_MSG) }
 }
 
 /// The link word of a message: a small block's first word, a large header's
@@ -304,14 +322,38 @@ impl Link for MsgLink {
     }
 }
 
-/// The owner stamp of the large block at `p`, allocated with alignment `align`.
+/// The owner stamp of the large block at `p`.
 ///
 /// # Safety
-/// `p` is a live large block allocated with alignment `align`.
+/// `p` is a live large block.
 #[inline(always)]
-unsafe fn large_owner(p: *mut u8, align: usize) -> *mut () {
-    // SAFETY: caller's contract; the header sits `large_offset` before the data.
-    unsafe { (*p.sub(large_offset(align)).cast::<LargeHeader>()).owner }
+unsafe fn large_owner(p: *mut u8) -> *mut () {
+    // SAFETY: caller's contract.
+    unsafe { (*large_header(p)).owner }
+}
+
+/// The header of the large block at `p`: the page right before the data,
+/// whatever the alignment, so it is found without the `Layout`.
+///
+/// # Safety
+/// `p` is a live large block.
+#[inline(always)]
+pub(crate) unsafe fn large_header(p: *mut u8) -> *mut LargeHeader {
+    // SAFETY: caller's contract: the data starts at least a page into the
+    // mapping (`large_offset`).
+    let _ = p;
+    ptr::with_exposed_provenance_mut(p.addr() - PAGE)
+}
+
+/// Start of the mapping whose header is `h`.
+///
+/// # Safety
+/// `h` is a live large header.
+#[inline(always)]
+unsafe fn large_base(h: *mut LargeHeader) -> *mut u8 {
+    // SAFETY: caller's contract: the data, a page after `h`, sits
+    // `large_offset(map_align)` into the mapping.
+    unsafe { h.cast::<u8>().add(PAGE).sub(large_offset((*h).map_align)) }
 }
 
 /// A block reached a heap that cannot take it: a `LocalHeap` block freed
@@ -324,7 +366,52 @@ pub(crate) fn foreign_free() -> ! {
     std::process::abort()
 }
 
-/// Distance from the start of a large mapping to the data.
+/// What a free without a size needs to know about a block (`block_of`).
+pub(crate) struct BlockInfo {
+    /// Owner stamp: the owning heap's address, or 0 for an explicit heap.
+    pub(crate) owner: *mut (),
+    /// Usable size in bytes.
+    pub(crate) size: usize,
+    /// The block's size class; `None` for a large block.
+    pub(crate) class: Option<usize>,
+    /// The block as a remote-free message.
+    pub(crate) msg: Msg,
+}
+
+/// Owner, size and kind of the live block at `p`, from metadata alone: the
+/// segment map tells small from large, then the segment's class table or the
+/// large header gives the rest.
+///
+/// # Safety
+/// `p` is a live block from a nonzero-size allocation of a heap whose segments
+/// are in the segment map.
+pub(crate) unsafe fn block_of(p: *mut u8) -> BlockInfo {
+    // SAFETY: caller's contract: the segment header or the large header of a
+    // live block is readable.
+    unsafe {
+        if segmap::is_segment(p) {
+            let seg = segment::segment_of(p);
+            let c = (*seg).classes[(p.addr() - seg.addr()) / SLOT_SIZE] as usize;
+            BlockInfo {
+                owner: (*seg).owner,
+                size: class::size_of(c),
+                class: Some(c),
+                msg: small_msg(p),
+            }
+        } else {
+            let h = large_header(p);
+            BlockInfo {
+                owner: (*h).owner,
+                size: (*h).map_size - large_offset((*h).map_align),
+                class: None,
+                msg: large_msg(p),
+            }
+        }
+    }
+}
+
+/// Distance from the start of a large mapping to the data. The header is the
+/// last page of it (`large_header`).
 #[inline(always)]
 fn large_offset(align: usize) -> usize {
     align.max(PAGE)
@@ -720,6 +807,8 @@ impl Inner {
             let bs = (*page).block_size;
             let b = (*page).free;
             let p = if !b.is_null() {
+                // As in `pop_free`: the page's provenance, not the last user's.
+                let b = page.cast::<Block>().with_addr(b.addr());
                 (*page).free = (*b).next;
                 b.cast::<u8>()
             } else if (*page).bump < (*page).capacity {
@@ -739,6 +828,11 @@ impl Inner {
         // SAFETY: `claim_span` returns a fresh page descriptor of this heap.
         unsafe {
             let page = self.claim_span(class::span_slots(c))?;
+            let seg = segment::segment_of((*page).start);
+            let first = ((*page).start.addr() - seg.addr()) / SLOT_SIZE;
+            for slot in first..first + (*page).span as usize {
+                (*seg).classes[slot] = c as u8;
+            }
             (*page).block_size = class::size_of(c);
             (*page).capacity = class::capacity(c) as u32;
             (*page).class = c as u8;
@@ -805,6 +899,7 @@ impl Inner {
             }
             let seg = segment::init_segment(base);
             (*seg).owner = self.owner;
+            segmap::mark(seg);
             (*seg).next = self.segments;
             if !self.segments.is_null() {
                 (*self.segments).prev = seg;
@@ -914,6 +1009,32 @@ impl Inner {
 
     // ---- deallocation ------------------------------------------------------
 
+    /// Frees the live block at `p` without its size: like `dealloc_owned`, with
+    /// the block's owner, size and kind from `block_of`. `foreign` receives the
+    /// owner, the message and the block's size.
+    ///
+    /// # Safety
+    /// As `dealloc_owned`; `p` came from a nonzero-size allocation of a heap
+    /// whose segments are in the segment map.
+    pub(crate) unsafe fn dealloc_unsized(
+        this: *mut Inner,
+        p: *mut u8,
+        foreign: impl FnOnce(*mut (), Msg, usize),
+    ) {
+        // SAFETY: caller's contract; `this` is dereferenced only once it
+        // matches the block's owner stamp.
+        unsafe {
+            let b = block_of(p);
+            if b.owner != this.cast() {
+                return foreign(b.owner, b.msg, b.size);
+            }
+            match b.class {
+                Some(c) => (*this).free_small(p, c),
+                None => (*this).free_large(p),
+            }
+        }
+    }
+
     /// `dealloc` for a heap reached without proof of ownership (`ShardAlloc`).
     /// A thread heap's owner stamp is its own address, so the check compares the
     /// block's stamp with `this` before touching `this`. A block of another heap
@@ -948,11 +1069,11 @@ impl Inner {
                     (*this).free_small(p, c);
                 }
                 None => {
-                    let owner = large_owner(p, layout.align());
+                    let owner = large_owner(p);
                     if owner != this.cast() {
-                        return foreign(owner, large_msg(p, layout.align()));
+                        return foreign(owner, large_msg(p));
                     }
-                    (*this).free_large(p, layout);
+                    (*this).free_large(p);
                 }
             }
         }
@@ -968,7 +1089,7 @@ impl Inner {
         unsafe {
             match class::class_for(layout) {
                 Some(_) => ((*segment::segment_of(p)).owner, small_msg(p)),
-                None => (large_owner(p, layout.align()), large_msg(p, layout.align())),
+                None => (large_owner(p), large_msg(p)),
             }
         }
     }
@@ -981,7 +1102,7 @@ impl Inner {
         match class::class_for(layout) {
             // SAFETY: caller's contract: `p` was allocated here with a fitting layout.
             Some(c) => unsafe { self.free_small(p, c) },
-            None => unsafe { self.free_large(p, layout) },
+            None => unsafe { self.free_large(p) },
         }
     }
 
@@ -1010,6 +1131,7 @@ impl Inner {
     unsafe fn free_block(&mut self, page: *mut Page, p: *mut u8) {
         // SAFETY: caller's contract.
         unsafe {
+            // The caller's pointer, not the page's: see `own_small`.
             let b = p.cast::<Block>();
             (*b).next = (*page).local_free;
             (*page).local_free = b;
@@ -1188,6 +1310,7 @@ impl Inner {
             if (*seg).used_slots == 1 {
                 self.stats.empty_segments -= 1;
             }
+            segmap::unmark(seg);
             self.unmap(
                 NonNull::new_unchecked(seg.cast()),
                 SEGMENT_SIZE,
@@ -1433,6 +1556,7 @@ impl Inner {
             let mut seg = self.segments;
             while !seg.is_null() {
                 let next = (*seg).next;
+                segmap::unmark(seg);
                 self.unmap(
                     NonNull::new_unchecked(seg.cast()),
                     SEGMENT_SIZE,
@@ -1475,7 +1599,8 @@ impl Inner {
         }
     }
 
-    /// Writes a large header at `base`, links it, and returns the data block.
+    /// Writes a large header a page before the data (`off` into the mapping at
+    /// `base`), links it, and returns the data block.
     unsafe fn link_large(
         &mut self,
         base: NonNull<u8>,
@@ -1485,7 +1610,8 @@ impl Inner {
     ) -> NonNull<[u8]> {
         // SAFETY: `base` is an unused mapping of `map_size` bytes owned by this heap.
         unsafe {
-            let h = base.as_ptr().cast::<LargeHeader>();
+            let h = base.as_ptr().add(off - PAGE).cast::<LargeHeader>();
+            let _ = h.expose_provenance();
             h.write(LargeHeader {
                 next: self.large,
                 prev: ptr::null_mut(),
@@ -1582,9 +1708,9 @@ impl Inner {
         }
     }
 
-    unsafe fn free_large(&mut self, p: *mut u8, layout: Layout) {
-        // SAFETY: `p` was returned by `alloc_large` (or `grow_large`) with this alignment.
-        unsafe { self.free_large_header(p.sub(large_offset(layout.align())).cast()) }
+    unsafe fn free_large(&mut self, p: *mut u8) {
+        // SAFETY: `p` was returned by `alloc_large` (or `grow_large`).
+        unsafe { self.free_large_header(large_header(p)) }
     }
 
     /// Frees the large mapping whose header is `h`.
@@ -1595,12 +1721,12 @@ impl Inner {
         // SAFETY: caller's contract.
         unsafe {
             self.unlink_large(h);
-            let (size, align) = ((*h).map_size, (*h).map_align);
+            let (size, align, base) = ((*h).map_size, (*h).map_align, large_base(h));
             self.stats.large_allocations -= 1;
             self.stats.allocated_bytes -= size;
-            if align != PAGE || !self.put_cached(h.cast(), size) {
+            if align != PAGE || !self.put_cached(base, size) {
                 self.stats.mapped_bytes -= size;
-                self.unmap(NonNull::new_unchecked(h.cast()), size, align);
+                self.unmap(NonNull::new_unchecked(base), size, align);
             }
         }
     }
@@ -1611,10 +1737,10 @@ impl Inner {
             let mut h = self.large;
             while !h.is_null() {
                 let next = (*h).next;
-                let (size, align) = ((*h).map_size, (*h).map_align);
+                let (size, align, base) = ((*h).map_size, (*h).map_align, large_base(h));
                 self.stats.allocated_bytes -= size;
                 self.stats.mapped_bytes -= size;
-                self.unmap(NonNull::new_unchecked(h.cast()), size, align);
+                self.unmap(NonNull::new_unchecked(base), size, align);
                 h = next;
             }
             self.large = ptr::null_mut();
@@ -1634,7 +1760,9 @@ impl Inner {
         // SAFETY: `p` is a live large allocation made with `old`.
         unsafe {
             if old.align() == new.align() && new.align() <= PAGE {
-                let h = p.sub(PAGE).cast::<LargeHeader>();
+                let h = large_header(p);
+                // The block with the mapping's provenance, not the caller's.
+                let p = h.cast::<u8>().add(PAGE);
                 let new_map = PAGE
                     .checked_add(new.size())
                     .and_then(|s| s.checked_next_multiple_of(PAGE))
@@ -1664,7 +1792,7 @@ impl Inner {
                     let base = NonNull::new_unchecked(m.base);
                     let n = self.link_large(base, m.size, PAGE, PAGE);
                     ptr::copy_nonoverlapping(p, n.as_ptr().cast::<u8>(), old.size());
-                    self.free_large(p, old);
+                    self.free_large(p);
                     return Ok(n);
                 }
                 // Never move region memory: it may be registered and pinned.
@@ -1728,7 +1856,7 @@ impl Inner {
         unsafe {
             match (class::class_for(old), class::class_for(new)) {
                 // Same class: the block already fits.
-                (Some(a), Some(b)) if a == b => Ok(slice(p, class::size_of(a))),
+                (Some(a), Some(b)) if a == b => Ok(slice(own_small(p), class::size_of(a))),
                 (None, None) => self.resize_large(p, old, new),
                 _ => self.realloc_move(p, old, new),
             }
@@ -1892,10 +2020,7 @@ mod tests {
             if class::class_for(l).is_some() {
                 (*segment::segment_of(p.as_ptr())).owner
             } else {
-                (*p.as_ptr()
-                    .sub(large_offset(l.align()))
-                    .cast::<LargeHeader>())
-                .owner
+                (*p.as_ptr().sub(PAGE).cast::<LargeHeader>()).owner
             }
         }
     }
@@ -1950,7 +2075,7 @@ mod tests {
                     if class::class_for(l).is_some() {
                         small_msg(p.as_ptr())
                     } else {
-                        large_msg(p.as_ptr(), l.align())
+                        large_msg(p.as_ptr())
                     }
                 }
             })
@@ -2004,6 +2129,24 @@ mod tests {
             heap.deallocate(p, l);
             heap.deallocate(keep.cast(), l);
         }
+    }
+
+    #[test]
+    fn large_header_sits_one_page_before_data_for_every_alignment() {
+        let heap = LocalHeap::new();
+        for align in [8, PAGE, 2 * PAGE, 1 << 20, 4 << 20, 8 << 20] {
+            let l = Layout::from_size_align(300_000, align).unwrap();
+            let p = heap.allocate(l).unwrap().cast::<u8>().as_ptr();
+            assert_eq!(p.addr() % align, 0);
+            // SAFETY: a live large block of this heap.
+            unsafe {
+                let h = large_header(p);
+                assert_eq!(h.addr(), p.addr() - PAGE, "align {align}");
+                assert_eq!((*h).map_align, align.max(PAGE));
+                heap.deallocate(NonNull::new(p).unwrap(), l);
+            }
+        }
+        assert_eq!(heap.stats().large_allocations, 0);
     }
 
     #[test]

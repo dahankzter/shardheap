@@ -9,7 +9,10 @@ repository = "https://github.com/dahankzter/shardheap"
 readme = "README.md"
 keywords = ["allocator", "arena", "heap", "thread-per-core", "mimalloc"]
 categories = ["memory-management", "data-structures"]
-exclude = ["/target*", "/.github"]
+exclude = ["/target*", "/.github", "/malloc"]
+
+[workspace]
+members = ["malloc"]
 
 [dependencies]
 libc = "0.2"

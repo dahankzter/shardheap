@@ -1,8 +1,8 @@
 //! Operating-system memory: map, unmap, remap, purge.
 //!
 //! On Linux this is `mmap`/`munmap`/`mremap`/`madvise`. Under Miri, and on other
-//! platforms, it falls back to the global allocator so the rest of the crate can be
-//! checked by Miri. Mapped memory is always zeroed.
+//! platforms, it falls back to the system allocator so the rest of the crate can
+//! be checked by Miri. Mapped memory is always zeroed.
 
 use core::ptr::NonNull;
 
@@ -48,6 +48,33 @@ mod imp {
             }
         }
         NonNull::new(raw.wrapping_add(head))
+    }
+
+    /// Reserves `size` bytes of zeroed address space without committing it
+    /// (`MAP_NORESERVE`): pages become resident as they are touched.
+    ///
+    /// # Safety
+    /// `size` is a nonzero multiple of `PAGE`.
+    pub(crate) unsafe fn reserve(size: usize) -> Option<NonNull<u8>> {
+        // SAFETY: anonymous private mapping, no aliasing with existing memory.
+        let raw = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        (raw != libc::MAP_FAILED).then(|| NonNull::new(raw.cast()))?
+    }
+
+    /// # Safety
+    /// `p` and `size` are a reservation from `reserve`, no longer used.
+    pub(crate) unsafe fn unreserve(p: NonNull<u8>, size: usize) {
+        // SAFETY: caller's contract.
+        unsafe { libc::munmap(p.as_ptr().cast(), size) };
     }
 
     /// # Safety
@@ -113,17 +140,28 @@ mod imp {
 #[cfg(not(all(target_os = "linux", not(miri))))]
 mod imp {
     use core::ptr::NonNull;
-    use std::alloc::{Layout, alloc_zeroed, dealloc};
+    // `System`, not the global allocator: that may be shardheap itself.
+    use std::alloc::{GlobalAlloc, Layout, System};
 
     pub(crate) unsafe fn map_aligned(size: usize, align: usize) -> Option<NonNull<u8>> {
         let layout = Layout::from_size_align(size, align).ok()?;
         // SAFETY: `size > 0`.
-        NonNull::new(unsafe { alloc_zeroed(layout) })
+        NonNull::new(unsafe { System.alloc_zeroed(layout) })
     }
 
     pub(crate) unsafe fn unmap(p: NonNull<u8>, size: usize, align: usize) {
         // SAFETY: allocated by `map_aligned` with this exact layout.
-        unsafe { dealloc(p.as_ptr(), Layout::from_size_align_unchecked(size, align)) }
+        unsafe { System.dealloc(p.as_ptr(), Layout::from_size_align_unchecked(size, align)) }
+    }
+
+    pub(crate) unsafe fn reserve(size: usize) -> Option<NonNull<u8>> {
+        // SAFETY: caller's contract.
+        unsafe { map_aligned(size, super::PAGE) }
+    }
+
+    pub(crate) unsafe fn unreserve(p: NonNull<u8>, size: usize) {
+        // SAFETY: caller's contract: a reservation from `reserve`.
+        unsafe { unmap(p, size, super::PAGE) }
     }
 
     pub(crate) unsafe fn remap(_p: NonNull<u8>, _old: usize, _new: usize) -> Option<NonNull<u8>> {
@@ -142,7 +180,7 @@ mod imp {
     }
 }
 
-pub(crate) use imp::{advise_huge, map_aligned, now_ms, purge, remap, unmap};
+pub(crate) use imp::{advise_huge, map_aligned, now_ms, purge, remap, reserve, unmap, unreserve};
 
 use core::alloc::{AllocError, Allocator, Layout};
 

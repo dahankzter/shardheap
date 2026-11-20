@@ -18,15 +18,13 @@
 
 use core::ptr;
 
+use core::cell::UnsafeCell;
+#[cfg(not(loom))]
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering::*};
 #[cfg(loom)]
 use loom::sync::{
     Mutex, MutexGuard,
     atomic::{AtomicPtr, AtomicU8, Ordering::*},
-};
-#[cfg(not(loom))]
-use {
-    core::sync::atomic::{AtomicPtr, AtomicU8, Ordering::*},
-    std::sync::{Mutex, MutexGuard},
 };
 
 /// An opaque message: one freed block, linked through a word the heap chooses.
@@ -120,19 +118,44 @@ pub(crate) struct PoolList {
     head: *mut Remote,
 }
 
-// SAFETY: the list is only touched under the pool's mutex.
-unsafe impl Send for PoolList {}
-
-/// Exited threads' heaps, waiting for a thread to adopt them.
+/// Exited threads' heaps, waiting for a thread to adopt them. The lock is our
+/// own, an atomic flag, not `std::sync::Mutex`: `fork` handlers must take it
+/// before the fork and release it on both sides without a guard
+/// (`lock_raw`, `unlock_raw`). Under Loom, which cannot explore a spin lock
+/// (every retry is a branch), it is Loom's mutex; the flag is checked by a
+/// native contention test instead.
 pub(crate) struct Pool {
-    lock: Mutex<PoolList>,
+    #[cfg(not(loom))]
+    locked: AtomicBool,
+    #[cfg(loom)]
+    lock: Mutex<()>,
+    list: UnsafeCell<PoolList>,
+}
+
+// SAFETY: `list` is only touched by the thread that holds the lock, which an
+// acquire swap takes and a release store gives back; its pointers are to
+// records that live for the process.
+unsafe impl Sync for Pool {}
+// SAFETY: as above.
+unsafe impl Send for Pool {}
+
+/// Waits a little before the next try at a held lock.
+#[cfg(not(loom))]
+fn wait(spins: &mut u32) {
+    if *spins < 64 {
+        core::hint::spin_loop();
+    } else {
+        std::thread::yield_now();
+    }
+    *spins += 1;
 }
 
 impl Pool {
     #[cfg(not(loom))]
     pub(crate) const fn new() -> Pool {
         Pool {
-            lock: Mutex::new(PoolList {
+            locked: AtomicBool::new(false),
+            list: UnsafeCell::new(PoolList {
                 head: ptr::null_mut(),
             }),
         }
@@ -141,21 +164,72 @@ impl Pool {
     #[cfg(loom)]
     pub(crate) fn new() -> Pool {
         Pool {
-            lock: Mutex::new(PoolList {
+            lock: Mutex::new(()),
+            list: UnsafeCell::new(PoolList {
                 head: ptr::null_mut(),
             }),
         }
     }
 
+    #[cfg(not(loom))]
     pub(crate) fn lock(&self) -> PoolGuard<'_> {
-        PoolGuard(self.lock.lock().unwrap_or_else(|e| e.into_inner()))
+        // SAFETY: released by the guard's drop.
+        unsafe { self.lock_raw() };
+        PoolGuard(self)
+    }
+
+    #[cfg(loom)]
+    pub(crate) fn lock(&self) -> PoolGuard<'_> {
+        PoolGuard(self, self.lock.lock().unwrap())
+    }
+
+    /// Takes the lock without a guard.
+    ///
+    /// # Safety
+    /// The caller releases it with `unlock_raw`, and touches the pool only
+    /// through a guard meanwhile (none: it holds the lock).
+    #[cfg(not(loom))]
+    pub(crate) unsafe fn lock_raw(&self) {
+        let mut spins = 0;
+        while self.locked.swap(true, Acquire) {
+            wait(&mut spins);
+        }
+    }
+
+    /// Releases a lock taken with `lock_raw`.
+    ///
+    /// # Safety
+    /// The lock is held and no guard is alive. After `fork`, the child's only
+    /// thread may release a lock its parent's forking thread took.
+    #[cfg(not(loom))]
+    pub(crate) unsafe fn unlock_raw(&self) {
+        self.locked.store(false, Release);
     }
 }
 
 /// The pool, locked.
-pub(crate) struct PoolGuard<'a>(MutexGuard<'a, PoolList>);
+#[cfg(not(loom))]
+pub(crate) struct PoolGuard<'a>(&'a Pool);
+#[cfg(loom)]
+pub(crate) struct PoolGuard<'a>(&'a Pool, #[allow(dead_code)] MutexGuard<'a, ()>);
+
+#[cfg(not(loom))]
+impl Drop for PoolGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the guard holds the lock.
+        unsafe { self.0.unlock_raw() }
+    }
+}
 
 impl PoolGuard<'_> {
+    /// The list, which the guard's lock makes this thread's alone.
+    #[allow(clippy::mut_from_ref)]
+    fn list(&self) -> &mut PoolList {
+        // SAFETY: the lock is held for the guard's life, and no caller keeps
+        // two of these borrows at once.
+        unsafe { &mut *self.0.list.get() }
+    }
+
     /// Marks `r` parked and adds it to the pool.
     ///
     /// # Safety
@@ -164,9 +238,9 @@ impl PoolGuard<'_> {
         // SAFETY: caller's contract.
         unsafe {
             (*r).state.store(PARKED, SeqCst);
-            (*r).pool_next.store(self.0.head, Relaxed);
+            (*r).pool_next.store(self.list().head, Relaxed);
         }
-        self.0.head = r;
+        self.list().head = r;
     }
 
     /// Takes the first parked remote for which `f` holds out of the pool and
@@ -176,13 +250,13 @@ impl PoolGuard<'_> {
         mut f: impl FnMut(*mut Remote) -> bool,
     ) -> Option<*mut Remote> {
         let mut prev: *mut Remote = ptr::null_mut();
-        let mut r = self.0.head;
+        let mut r = self.list().head;
         while !r.is_null() {
             // SAFETY: remotes in the pool are live (`park`'s contract).
             let next = unsafe { (*r).pool_next.load(Relaxed) };
             if f(r) {
                 if prev.is_null() {
-                    self.0.head = next;
+                    self.list().head = next;
                 } else {
                     // SAFETY: as above.
                     unsafe { (*prev).pool_next.store(next, Relaxed) };
@@ -199,12 +273,12 @@ impl PoolGuard<'_> {
 
     /// Some parked remote, left in the pool.
     pub(crate) fn first(&self) -> Option<*mut Remote> {
-        (!self.0.head.is_null()).then_some(self.0.head)
+        (!self.list().head.is_null()).then_some(self.list().head)
     }
 
     /// Whether `r` is in the pool (still parked).
     pub(crate) fn contains(&self, r: *mut Remote) -> bool {
-        let mut p = self.0.head;
+        let mut p = self.list().head;
         while !p.is_null() {
             if p == r {
                 return true;
@@ -393,6 +467,56 @@ mod tests {
         let mut want = pushed.to_vec();
         want.sort_unstable();
         assert_eq!(all, want, "every message drained exactly once");
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn pool_lock_excludes_under_contention() {
+        let pool = std::sync::Arc::new(Pool::new());
+        let n = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let rounds = if cfg!(miri) { 50 } else { 100_000 };
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (pool, n) = (pool.clone(), n.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..rounds {
+                        let _g = pool.lock();
+                        // Not an atomic increment: only the lock makes it one.
+                        let v = n.load(Relaxed);
+                        n.store(v + 1, Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(n.load(Relaxed), 8 * rounds);
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn loom_pool_lock_excludes() {
+        use loom::sync::atomic::AtomicUsize;
+        loom::model(|| {
+            let pool = loom::sync::Arc::new(Pool::new());
+            let n = loom::sync::Arc::new(AtomicUsize::new(0));
+            let others: Vec<_> = (0..2)
+                .map(|_| {
+                    let (pool, n) = (pool.clone(), n.clone());
+                    loom::thread::spawn(move || {
+                        let _g = pool.lock();
+                        // Not an atomic increment: only the lock makes it one.
+                        let v = n.load(Relaxed);
+                        n.store(v + 1, Relaxed);
+                    })
+                })
+                .collect();
+            for t in others {
+                t.join().unwrap();
+            }
+            assert_eq!(n.load(Relaxed), 2);
+        });
     }
 
     #[cfg(loom)]

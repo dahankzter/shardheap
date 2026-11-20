@@ -74,6 +74,11 @@ pub(crate) struct Segment {
     /// stalled `lifo_64B` by 30%; re-measured in stage B, it no longer does
     /// (24.8 µs either way).
     pub(crate) owner: *mut (),
+    /// Size class of the page each slot belongs to, written when the page is
+    /// made. A free without a size reads the class here, on a line the owner
+    /// writes only as pages come and go, not from the page descriptor, whose
+    /// line is written on every allocation.
+    pub(crate) classes: [u8; SLOTS],
     pub(crate) pages: [Page; SLOTS],
 }
 
@@ -83,7 +88,7 @@ const _: () = assert!(core::mem::size_of::<Segment>() <= SLOT_SIZE);
 /// The segment containing `p`.
 #[inline(always)]
 pub(crate) fn segment_of(p: *mut u8) -> *mut Segment {
-    p.map_addr(|a| a & !(SEGMENT_SIZE - 1)).cast()
+    core::ptr::with_exposed_provenance_mut(p.addr() & !(SEGMENT_SIZE - 1))
 }
 
 /// The head page of the span containing `p`.
@@ -136,6 +141,7 @@ pub(crate) fn for_each_run(mut mask: u64, mut f: impl FnMut(usize, usize)) {
 /// `base` is a zeroed, `SEGMENT_SIZE`-aligned mapping of `SEGMENT_SIZE` bytes.
 pub(crate) unsafe fn init_segment(base: NonNull<u8>) -> *mut Segment {
     let seg = base.as_ptr().cast::<Segment>();
+    let _ = seg.expose_provenance();
     // SAFETY: the header fits in slot 0 of the mapping; zero is a valid value for
     // every other field.
     unsafe {

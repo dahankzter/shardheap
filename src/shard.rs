@@ -11,7 +11,7 @@
 //! its own on its slow path. When a thread exits, its record is parked in a
 //! pool, still receiving messages, and a thread that starts later adopts it.
 
-use core::alloc::{AllocError, Allocator, Layout};
+use core::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
 use core::cell::{Cell, UnsafeCell};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::Ordering::Relaxed;
@@ -449,7 +449,7 @@ fn remote_free(owner: *mut (), m: Msg, bytes: usize) {
         }
         return;
     }
-    let r = if cur == empty() { init_for_free() } else { cur };
+    let r = if cur == empty() { init_current() } else { cur };
     // SAFETY: the current thread's record; `owner` is a record (stamps are
     // record addresses), and records are never freed.
     unsafe {
@@ -537,26 +537,78 @@ struct ExitGuard;
 
 impl Drop for ExitGuard {
     fn drop(&mut self) {
-        if let Some(h) = existing() {
-            let r = h.cast::<Record>();
-            // SAFETY: the current thread's record; nothing else references it now.
-            unsafe {
-                // Frees batched for other heaps must not die with the thread.
-                // Before the pool lock: a flush may lock it to drain a parked heap.
-                (*(*r).batch.get()).flush_all();
-                let mut g = POOL.lock();
-                let rest = (*r).remainder.get();
-                (*r).remainder
-                    .set((*(*r).inner.get()).free_msgs(rest, usize::MAX));
-                // Parked first, then drained: a sender that pushes after the
-                // drain sees `PARKED` and drains under the lock itself.
-                g.park(remote_of(r));
-                drain_all(r);
-                settle(r);
-                drop(g);
-            }
-            CURRENT.with(|c| c.set(torn()));
+        exit_thread();
+    }
+}
+
+/// Parks the current thread's record, if it has one: its batches sent, its
+/// inbox drained, then `CURRENT` torn. Runs from `ExitGuard`'s destructor or
+/// from `exit_key`'s, whichever comes first; the second finds nothing to do.
+fn exit_thread() {
+    if let Some(h) = existing() {
+        let r = h.cast::<Record>();
+        // SAFETY: the current thread's record; nothing else references it now.
+        unsafe {
+            // Frees batched for other heaps must not die with the thread.
+            // Before the pool lock: a flush may lock it to drain a parked heap.
+            (*(*r).batch.get()).flush_all();
+            let mut g = POOL.lock();
+            let rest = (*r).remainder.get();
+            (*r).remainder
+                .set((*(*r).inner.get()).free_msgs(rest, usize::MAX));
+            // Parked first, then drained: a sender that pushes after the
+            // drain sees `PARKED` and drains under the lock itself.
+            g.park(remote_of(r));
+            drain_all(r);
+            settle(r);
+            drop(g);
         }
+        CURRENT.with(|c| c.set(torn()));
+    }
+}
+
+/// A pthread key whose destructor also parks the record (`exit_thread`).
+/// glibc runs Rust's thread-local destructors (`ExitGuard`) before pthread
+/// keys' destructors; a thread that first uses the heap in a key's destructor
+/// registers `ExitGuard` too late for it to run, and would strand its record.
+/// A key set during another key's destructor is run again (up to
+/// `PTHREAD_DESTRUCTOR_ITERATIONS` rounds), so this one still parks it.
+#[cfg(all(unix, not(miri)))]
+mod exit_key {
+    use core::sync::atomic::AtomicUsize;
+    use core::sync::atomic::Ordering::{AcqRel, Acquire};
+
+    const NONE: usize = usize::MAX;
+    static KEY: AtomicUsize = AtomicUsize::new(NONE);
+
+    unsafe extern "C" fn dtor(_: *mut libc::c_void) {
+        super::exit_thread();
+    }
+
+    fn key() -> libc::pthread_key_t {
+        let k = KEY.load(Acquire);
+        if k != NONE {
+            return k as libc::pthread_key_t;
+        }
+        let mut new = 0;
+        // SAFETY: a plain destructor with the expected signature.
+        if unsafe { libc::pthread_key_create(&mut new, Some(dtor)) } != 0 {
+            std::process::abort();
+        }
+        match KEY.compare_exchange(NONE, new as usize, AcqRel, Acquire) {
+            Ok(_) => new,
+            Err(won) => {
+                // SAFETY: our own key, never used.
+                unsafe { libc::pthread_key_delete(new) };
+                won as libc::pthread_key_t
+            }
+        }
+    }
+
+    /// Arms the key on this thread: its destructor runs at thread exit.
+    pub(super) fn arm(r: *mut super::Record) {
+        // SAFETY: a live key; a non-null value makes its destructor run.
+        unsafe { libc::pthread_setspecific(key(), r.cast()) };
     }
 }
 
@@ -574,7 +626,32 @@ const _: () = assert!(
 );
 
 /// Maps, initializes and registers a new record.
+/// Registers the `fork` handlers, once: the pool lock is taken before a fork
+/// and released after it in the parent and the child, so a child forked while
+/// another thread held the lock does not inherit it held forever. In the
+/// child, other threads' records stay active with nobody to drain them: their
+/// memory is leaked.
+fn fork_handlers() {
+    #[cfg(all(unix, not(miri)))]
+    {
+        static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        unsafe extern "C" fn prepare() {
+            // SAFETY: released by `release` on both sides of the fork.
+            unsafe { POOL.lock_raw() }
+        }
+        unsafe extern "C" fn release() {
+            // SAFETY: taken by `prepare` just before the fork.
+            unsafe { POOL.unlock_raw() }
+        }
+        if !DONE.swap(true, Relaxed) {
+            // SAFETY: plain function pointers with the expected signature.
+            unsafe { libc::pthread_atfork(Some(prepare), Some(release), Some(release)) };
+        }
+    }
+}
+
 fn new_record() -> *mut Record {
+    fork_handlers();
     // SAFETY: PAGE is a nonzero multiple of itself; PAGE alignment.
     let Some(base) = (unsafe { os::map_aligned(PAGE, PAGE) }) else {
         std::alloc::handle_alloc_error(Layout::new::<Record>())
@@ -602,6 +679,11 @@ fn new_record() -> *mut Record {
 #[cold]
 #[inline(never)]
 fn init_current() -> *mut Record {
+    // Initializing: an allocation made while the record is being found or
+    // made (none is expected; this guards re-entry) takes the torn path, a
+    // parked record under the pool lock, instead of re-entering setup. The
+    // pool lock is not held across anything that allocates.
+    CURRENT.with(|c| c.set(torn()));
     let adopted = {
         let mut g = POOL.lock();
         let r = g
@@ -614,28 +696,14 @@ fn init_current() -> *mut Record {
     set_current(adopted.unwrap_or_else(new_record))
 }
 
-/// First use on this thread is a free (of another heap's block): a record is
-/// needed for the batch cache, but one with live blocks would never be drained
-/// by a thread that does not allocate, so only an empty parked one is adopted.
-#[cold]
-#[inline(never)]
-fn init_for_free() -> *mut Record {
-    let adopted = {
-        let mut g = POOL.lock();
-        let r = g
-            .pop_where(|rm| warm(record_of(rm)))
-            .or_else(|| g.pop_where(|rm| holds_nothing(record_of(rm))))
-            .map(record_of);
-        r.inspect(|&r| unwarm(r))
-    };
-    set_current(adopted.unwrap_or_else(new_record))
-}
-
 fn set_current(r: *mut Record) -> *mut Record {
     CURRENT.with(|c| c.set(r));
-    // Registers the exit guard's destructor. Fails only if this thread is
-    // already tearing down; then there is no exit left to guard.
+    // Registers the exit guard's destructor. Fails if this thread's Rust
+    // thread-locals are already being destroyed (first use in a later
+    // destructor); `exit_key` parks the record then.
     let _ = EXIT.try_with(|_| ());
+    #[cfg(all(unix, not(miri)))]
+    exit_key::arm(r);
     r
 }
 
@@ -742,11 +810,81 @@ impl ShardAlloc {
         }
     }
 
+    /// The usable size of the block at `ptr`: at least what was asked for, and
+    /// exactly the length `allocate` returned. Found from the block's address
+    /// alone, without its `Layout` (for C's `malloc_usable_size`).
+    ///
+    /// # Safety
+    /// `ptr` is a live block from a nonzero-size allocation by `ShardAlloc`, on
+    /// any thread.
+    pub unsafe fn usable_size(ptr: NonNull<u8>) -> usize {
+        // SAFETY: caller's contract.
+        unsafe { heap::block_of(ptr.as_ptr()).size }
+    }
+
+    /// Frees the block at `ptr` without its `Layout`, as C's `free` does: the
+    /// size and kind come from the block's metadata. A block of another
+    /// thread's heap is sent home, as by `deallocate`.
+    ///
+    /// # Safety
+    /// `ptr` is a live block from a nonzero-size allocation by `ShardAlloc`, on
+    /// any thread, and is not used again.
+    pub unsafe fn free_unsized(ptr: NonNull<u8>) {
+        let this = owner_this();
+        // SAFETY: caller's contract; `this` is the empty heap or the current
+        // thread's heap, whose owner stamp is its address.
+        unsafe {
+            Inner::dealloc_unsized(this, ptr.as_ptr(), |owner, m, bytes| {
+                remote_free(owner, m, bytes)
+            })
+        }
+    }
+
     /// [`LocalHeap::trim`](crate::LocalHeap::trim) for the current thread's heap.
     pub fn trim() {
         if let Some(h) = existing() {
             // SAFETY: as `stats`.
             unsafe { (*h).trim() }
+        }
+    }
+}
+
+// SAFETY: forwards to the `Allocator` methods below, which uphold the
+// allocator contract; failure is a null pointer.
+unsafe impl GlobalAlloc for ShardAlloc {
+    #[inline]
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        match Allocator::allocate(self, layout) {
+            Ok(b) => b.cast::<u8>().as_ptr(),
+            Err(AllocError) => ptr::null_mut(),
+        }
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: caller's contract: `ptr` is a live block allocated with `layout`.
+        unsafe { Allocator::deallocate(self, NonNull::new_unchecked(ptr), layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        match Allocator::allocate_zeroed(self, layout) {
+            Ok(b) => b.cast::<u8>().as_ptr(),
+            Err(AllocError) => ptr::null_mut(),
+        }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: caller's contract: `ptr` is live with `layout`, and
+        // `new_size` rounded to `layout.align()` does not overflow.
+        unsafe {
+            let p = NonNull::new_unchecked(ptr);
+            let new = Layout::from_size_align_unchecked(new_size, layout.align());
+            let r = if new_size >= layout.size() {
+                Allocator::grow(self, p, layout, new)
+            } else {
+                Allocator::shrink(self, p, layout, new)
+            };
+            r.map_or(ptr::null_mut(), |b| b.cast::<u8>().as_ptr())
         }
     }
 }
@@ -902,6 +1040,197 @@ mod tests {
         s.allocated_bytes == 0
             && s.segments <= 1
             && s.mapped_bytes == s.segments * crate::segment::SEGMENT_SIZE
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn fork_while_another_thread_holds_the_pool_lock() {
+        let _g = serial();
+        let b = std::thread::spawn(|| {
+            let l = Layout::new::<[u8; 64]>();
+            Sent(ShardAlloc::new().allocate(l).unwrap().cast::<u8>().as_ptr())
+        })
+        .join()
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _l = POOL.lock();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+        rx.recv().unwrap();
+        // SAFETY: fork; the child only allocates, frees and `_exit`s.
+        match unsafe { libc::fork() } {
+            0 => unsafe {
+                let v: Vec<u8, ShardAlloc> = Vec::with_capacity_in(100, ShardAlloc::new());
+                drop(v);
+                // A block of the exited thread's parked heap: sent there,
+                // which takes the pool lock.
+                ShardAlloc::free_unsized(NonNull::new(b.0.cast_mut()).unwrap());
+                let mut big: Vec<u8, ShardAlloc> = Vec::new_in(ShardAlloc::new());
+                big.resize(1 << 20, 1);
+                drop(big);
+                libc::_exit(0)
+            },
+            pid => {
+                assert!(pid > 0);
+                let mut st = 0;
+                // SAFETY: waiting for our own child.
+                assert_eq!(unsafe { libc::waitpid(pid, &mut st, 0) }, pid);
+                assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
+            }
+        }
+        holder.join().unwrap();
+        // The child freed its copy; the parent's block is still live.
+        // SAFETY: a live block of the exited thread's (parked) heap.
+        unsafe { ShardAlloc::free_unsized(NonNull::new(b.0.cast_mut()).unwrap()) };
+    }
+
+    fn record_count() -> usize {
+        let mut n = 0;
+        let mut r = RECORDS.load(Ordering::Acquire);
+        while !r.is_null() {
+            n += 1;
+            // SAFETY: records are never freed; `next` is set before publishing.
+            r = unsafe { (*r).next };
+        }
+        n
+    }
+
+    #[test]
+    fn threads_that_start_by_freeing_adopt_parked_heaps() {
+        let _g = serial();
+        let l = Layout::new::<[u8; 1024]>();
+        let alloc = move || Sent(ShardAlloc::new().allocate(l).unwrap().cast::<u8>().as_ptr());
+        let free = move |b: Sent<u8>| {
+            // SAFETY: a live block, allocated with `l`.
+            unsafe { ShardAlloc::new().deallocate(NonNull::new(b.0.cast_mut()).unwrap(), l) }
+        };
+        // larson's pattern: each thread's first operation frees a block an
+        // earlier thread allocated, then it allocates one to hand on. Blocks
+        // live for 64 generations, so parked heaps keep live blocks.
+        let mut carry: std::collections::VecDeque<Sent<u8>> =
+            std::thread::spawn(move || (0..64).map(|_| alloc()).collect())
+                .join()
+                .unwrap();
+        let before = record_count();
+        for _ in 0..50 {
+            carry = std::thread::spawn(move || {
+                let mut c = carry;
+                free(c.pop_front().unwrap());
+                c.push_back(alloc());
+                c
+            })
+            .join()
+            .unwrap();
+        }
+        let made = record_count() - before;
+        assert!(made <= 4, "{made} new records for 50 short-lived threads");
+        std::thread::spawn(move || carry.into_iter().for_each(free))
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn threads_first_using_the_heap_in_a_key_destructor_park_it() {
+        let _g = serial();
+        unsafe extern "C" fn dtor(p: *mut libc::c_void) {
+            // This thread's first use of `ShardAlloc`, after the Rust
+            // thread-locals' destructors have run.
+            // SAFETY: a live block, set as this key's value below.
+            unsafe { ShardAlloc::free_unsized(NonNull::new(p.cast()).unwrap()) }
+        }
+        let mut key = 0;
+        // SAFETY: a fresh key with a plain destructor.
+        assert_eq!(unsafe { libc::pthread_key_create(&mut key, Some(dtor)) }, 0);
+        let l = Layout::new::<[u8; 64]>();
+        let before = record_count();
+        for _ in 0..50 {
+            let b = Sent(ShardAlloc::new().allocate(l).unwrap().cast::<u8>().as_ptr());
+            std::thread::spawn(move || {
+                let b = b;
+                // SAFETY: the key is live; the value is freed by its destructor.
+                unsafe { libc::pthread_setspecific(key, b.0.cast()) };
+            })
+            .join()
+            .unwrap();
+        }
+        let made = record_count() - before;
+        // SAFETY: no thread uses the key any more.
+        unsafe { libc::pthread_key_delete(key) };
+        ShardAlloc::maintain();
+        assert!(made <= 4, "{made} new records for 50 threads");
+    }
+
+    #[test]
+    fn usable_size_is_the_block_size() {
+        let _g = serial();
+        let cases = [
+            (1, 1),
+            (24, 8),
+            (1000, 16),
+            (100_000, 64),
+            (300_000, 8),
+            (300_000, 1 << 20),
+        ];
+        for (size, align) in cases {
+            let l = Layout::from_size_align(size, align).unwrap();
+            let b = ShardAlloc::new().allocate(l).unwrap();
+            let p = b.cast::<u8>();
+            // SAFETY: a live, nonzero-size block of `ShardAlloc`.
+            unsafe {
+                assert_eq!(ShardAlloc::usable_size(p), b.len(), "{size}/{align}");
+                ShardAlloc::free_unsized(p);
+            }
+        }
+        assert_eq!(ShardAlloc::stats().allocated_bytes, 0);
+    }
+
+    #[test]
+    fn free_unsized_on_another_thread_sends_the_block_home() {
+        let _g = serial();
+        let blocks: Vec<Sent<u8>> = [64usize, 1024, 4096, 300_000]
+            .iter()
+            .map(|&s| {
+                let l = Layout::from_size_align(s, 8).unwrap();
+                Sent(ShardAlloc::new().allocate(l).unwrap().cast::<u8>().as_ptr())
+            })
+            .collect();
+        std::thread::spawn(move || {
+            for b in blocks {
+                // SAFETY: live blocks of the spawning thread's heap.
+                unsafe { ShardAlloc::free_unsized(NonNull::new(b.0.cast_mut()).unwrap()) }
+            }
+        })
+        .join()
+        .unwrap();
+        ShardAlloc::maintain();
+        assert_eq!(ShardAlloc::stats().allocated_bytes, 0);
+    }
+
+    #[test]
+    fn free_unsized_after_the_owner_exited_frees_once() {
+        let _g = serial();
+        let (r, b) = std::thread::spawn(|| {
+            let b = ShardAlloc::new()
+                .allocate(Layout::new::<[u8; 1024]>())
+                .unwrap();
+            (current_record(), Sent(b.cast::<u8>().as_ptr()))
+        })
+        .join()
+        .unwrap();
+        assert!(parked(&r));
+        // Freed on a third thread: its exit flushes the batch to the parked
+        // heap, which the sender drains under the pool lock.
+        std::thread::spawn(move || {
+            let b = b; // the whole `Sent`, not its raw-pointer field
+            // SAFETY: a live block of the exited thread's (parked) heap.
+            unsafe { ShardAlloc::free_unsized(NonNull::new(b.0.cast_mut()).unwrap()) }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(record_stats(r).allocated_bytes, 0);
     }
 
     #[test]

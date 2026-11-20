@@ -246,12 +246,12 @@ of the benchmark's push loop, not the heap.
 ## Thread heaps (`ShardAlloc`)
 
 `ShardAlloc` is a zero-sized allocator value meaning "the current thread's
-heap". It is what a global allocator is, in `Allocator` form; phase 4 puts it
-behind `GlobalAlloc`.
+heap". It is what a global allocator is, in `Allocator` form, and it
+implements `GlobalAlloc` too ([below](#global-allocator-and-malloc)).
 
 - **Records.** Each thread's heap lives in a *record*: heap state at an
   address that never changes, mapped through `os.rs` (not the global allocator,
-  which shardheap will become in phase 4) and never freed. Records are pushed
+  which may be shardheap itself) and never freed. Records are pushed
   onto a static list, so they stay reachable (Miri's leak check) and stage B
   can walk them.
 - **Lookup.** A const `thread_local!` `Cell` holds the current record: one
@@ -417,6 +417,101 @@ per sender (every benchmarked inbox has one sender, and compare-and-swap
 retries were 1%), and an `xchg`-based queue (locked like compare-and-swap, so
 it stalls the same way).
 
+## Global allocator and `malloc`
+
+`ShardAlloc` implements `GlobalAlloc` over its `Allocator` methods, and
+`malloc/` builds the C allocation API over the same heaps as a shared library
+for `LD_PRELOAD`. Three things a heap handle never needed:
+
+- **A free without a size.** C's `free(p)` and `realloc(p, n)` pass no size.
+  A *segment map*, one bit per 4 MiB of address space (4 MiB reserved with
+  `MAP_NORESERVE` for x86-64's 47 bits, 8 MiB for aarch64's 48), says whether
+  `p` lies in a segment (a small block) or not (a large one). A small block's
+  size class comes from a per-slot table in the segment header, written when a
+  page is made, on a line the owner rarely writes: not from the page
+  descriptor, whose line is written on every allocation and would cost a
+  remote free a miss. A large block's header is the page right before the
+  data, for every alignment. `ShardAlloc::usable_size` and
+  `ShardAlloc::free_unsized` are public; the `Allocator` and `GlobalAlloc`
+  paths keep using the `Layout` and never read the map.
+- **Thread exit.** A Rust thread-local's destructor parks the record
+  (`ExitGuard`), and so does a pthread key's (`exit_key`): glibc runs Rust's
+  thread-local destructors before pthread keys' destructors, so a thread
+  whose first allocator call is in a key's destructor would otherwise strand
+  its record, one per thread (4 GB for 2000 threads, `malloc/tests/tsd.c`).
+- **Re-entrancy.** While a thread finds or makes its record, `CURRENT` points
+  at the torn heap, so an allocation made meanwhile takes the post-exit path
+  (a parked record under the pool lock) instead of re-entering setup; the
+  pool lock is not held across anything that allocates. The exit destructor's
+  registration can allocate (glibc's `__cxa_thread_atexit_impl` calls
+  `calloc`); it runs after `CURRENT` holds the record, so it allocates from it.
+- **`fork`.** `pthread_atfork` handlers take the pool lock before a fork and
+  release it on both sides, so a child forked while another thread held it
+  does not deadlock. `std::sync::Mutex` cannot be released without its guard,
+  so the pool lock is an atomic flag (spin, then yield). In the child, other
+  threads' records stay active with nobody to drain them; their memory is
+  leaked, as in mimalloc.
+
+The C library is built with nightly's `-Z tls-model=initial-exec`: in a shared
+library, stable Rust reads every thread-local through a call to
+`__tls_get_addr`; `malloc/tests/run.sh` checks that no shardheap function
+calls it. Built that way, the library must be loaded at startup.
+
+### mimalloc-bench
+
+[mimalloc-bench](https://github.com/daanx/mimalloc-bench) with each allocator
+preloaded (`malloc/bench/run.py`), on the same Threadripper, 64 threads where
+a benchmark takes a count (128 for sh6bench and sh8bench), median of three
+runs. Each cell is time / peak resident memory relative to mimalloc 1.8.2,
+whose own figures are in its column. jemalloc and tcmalloc (gperftools) are
+the system's, snmalloc built from its repository. larson, rptest,
+xmalloc-test and glibc-thread run for a fixed time; theirs is the relative
+time bench.sh computes. redis, rocksdb, lean, z3, ruby and lua were not run.
+
+| benchmark | glibc | mimalloc | jemalloc | tcmalloc | snmalloc | **shardheap** |
+|---|---|---|---|---|---|---|
+| cfrac | 0.99 / 0.97 | 2.168 s, 14 MiB | 1.01 / 0.97 | 1.00 / 1.00 | 0.99 / 1.01 | 1.13 / 1.01 |
+| espresso | 1.10 / 1.00 | 2.295 s, 14 MiB | 1.02 / 0.93 | 0.98 / 1.00 | 0.98 / 1.00 | 1.04 / 0.97 |
+| barnes | 1.02 / 0.91 | 1.135 s, 66 MiB | 0.99 / 1.13 | 1.02 / 1.10 | 1.02 / 1.04 | 1.01 / 0.98 |
+| gs | 1.03 / 0.67 | 0.126 s, 47 MiB | 1.09 / 0.92 | 1.06 / 0.85 | 1.04 / 0.97 | 1.02 / 0.89 |
+| alloc-test1 | 1.17 / 0.69 | 1.854 s, 20 MiB | 1.06 / 1.08 | 1.00 / 0.98 | 1.01 / 0.90 | 1.39 / 0.90 |
+| alloc-testN | 1.15 / 0.18 | 1.903 s, 72 MiB | 1.00 / 1.04 | 1.04 / 0.19 | 1.00 / 0.50 | 1.19 / 1.05 |
+| larsonN | 1.61 / 0.98 | 0.614 s, 574 MiB | 1.17 / 1.13 | 1.36 / 0.52 | 1.05 / 1.34 | 1.47 / 1.00 |
+| larsonN-sized | 1.62 / 0.98 | 0.597 s, 581 MiB | 1.14 / 1.14 | 1.22 / 0.55 | 1.03 / 1.33 | 1.51 / 0.99 |
+| sh6benchN | 62.70 / 0.63 | 0.023 s, 494 MiB | 1.42 / 0.79 | 5.78 / 0.42 | 1.25 / 1.06 | 1.92 / 0.94 |
+| sh8benchN | 37.57 / 0.52 | 0.070 s, 797 MiB | 1.68 / 0.52 | 23.86 / 0.17 | 0.97 / 0.56 | 4.21 / 0.42 |
+| xmalloc-testN | 2.61 / 0.41 | 0.100 s, 261 MiB | 0.64 / 1.98 | 747.77 / 0.22 | 0.89 / 1.01 | 0.91 / 1.43 |
+| cache-thrash1 | 1.07 / 1.03 | 0.745 s, 13 MiB | 1.07 / 1.04 | 1.07 / 1.03 | 1.07 / 1.00 | 1.00 / 1.00 |
+| cache-thrashN | 1.02 / 1.00 | 0.031 s, 14 MiB | 1.04 / 0.96 | 1.05 / 0.96 | 0.96 / 1.00 | 0.95 / 1.00 |
+| cache-scratch1 | 1.07 / 0.92 | 0.525 s, 14 MiB | 1.00 / 1.00 | 1.07 / 0.97 | 1.07 / 0.96 | 1.07 / 1.00 |
+| cache-scratchN | 0.92 / 1.03 | 0.022 s, 13 MiB | 0.93 / 1.04 | 1.07 / 1.04 | 0.99 / 1.08 | 0.94 / 10.69 |
+| malloc-large | 1.07 / 0.93 | 0.968 s, 562 MiB | 1.67 / 0.80 | 1.02 / 0.99 | 1.02 / 1.19 | 1.25 / 0.90 |
+| mstressN | 1.32 / 0.69 | 1.075 s, 2398 MiB | 1.03 / 0.55 | 1.33 / 0.40 | 0.98 / 0.68 | 1.79 / 0.50 |
+| mleak10 | 1.04 / 0.87 | 0.078 s, 15 MiB | 1.09 / 1.53 | 1.04 / 0.86 | 0.98 / 0.90 | 1.01 / 0.97 |
+| mleak100 | 1.03 / 1.00 | 0.732 s, 14 MiB | 1.07 / 1.99 | 1.04 / 0.96 | 1.01 / 0.89 | 1.05 / 1.10 |
+| rptestN | 1.60 / 0.56 | 0.627 s, 449 MiB | 1.70 / 1.27 | 6.02 / 0.42 | 0.77 / 1.02 | 1.12 / 2.00 |
+| glibc-simple | 2.39 / 1.09 | 0.787 s, 13 MiB | 1.32 / 1.11 | 1.04 / 1.06 | 0.99 / 1.09 | 1.29 / 1.05 |
+| glibc-thread | 1.11 / 0.04 | 0.121 s, 389 MiB | 0.93 / 0.70 | 1.89 / 0.03 | 0.92 / 0.19 | 1.58 / 0.68 |
+
+What this first run found, before any tuning for these workloads:
+
+- **A leak, fixed.** On larson, shardheap grew without bound (33 GiB). A
+  thread whose first operation was a free adopted only an empty parked heap,
+  and larson's threads start by freeing blocks inherited from their
+  predecessors: every thread made a new record and stranded the last one,
+  holding live blocks. Now a first free adopts like a first allocation
+  (`threads_that_start_by_freeing_adopt_parked_heaps`); larson stays at
+  about 570 MiB, as mimalloc does.
+- **Single-threaded C programs are 13-39% slower than mimalloc** (cfrac,
+  alloc-test, glibc-simple, malloc-large): the C path pays for the lookup of
+  a free without a size and for calls the Rust paths inline.
+- **Threaded stress tests are 1.5-4x slower** (larson, mstress, sh8bench,
+  glibc-thread), while xmalloc-test, pure producer-consumer, is 0.91.
+- **cache-scratch with 64 threads peaks at 137 MiB against 13**: with
+  transparent huge pages set to `always`, each thread's first segment is
+  backed by a 2 MiB huge page (`HugePages::Auto` leaves new heaps to the
+  kernel).
+
 ## What Rust allows that C does not
 
 - **The size comes with every free.** The class, and the small/large decision,
@@ -431,13 +526,31 @@ it stalls the same way).
 ## Unsafe surface and checking
 
 All raw-memory logic is in `heap.rs`, `segment.rs` and `os.rs`. Free-list links
-are stored as pointers, so provenance travels with them, and the segment mask
-uses `map_addr`. That is compatible with strict provenance. Under Miri, `os.rs`
-maps memory with the global allocator, so Miri checks everything above the
-syscalls:
+are stored as pointers. As a global allocator, a pointer handed to `dealloc`
+or `realloc` comes from std's `Box` and `Vec`, whose references narrow it to
+the value (one byte for a `Box<u8>`), and three rules follow:
+
+- **Metadata is never reached through it.** Reading the segment header or a
+  large header through the caller's pointer is undefined behaviour under
+  both Stacked and Tree Borrows. Segment and large headers expose their
+  provenance when they are mapped; `segment_of` and `large_header` look them
+  up with `ptr::with_exposed_provenance`.
+- **A block handed out again carries our provenance**, not its last user's:
+  a block popped off a free list (`pop_free`, `take_block`) and a block
+  resized in place (`own_small`, `resize_large`).
+- **A block being freed is written through the caller's pointer.** During
+  the free, the caller's tag is protected; a write through any other
+  provenance would invalidate it. Tree Borrows allows the write past the
+  tag's initial range; Stacked Borrows does not, and no allocator that links
+  freed blocks through their own memory can pass it for a `Box<u8>`. The
+  global-allocator test runs under Tree Borrows; the rest under both.
+
+Under Miri, `os.rs` maps memory with the system allocator, so Miri checks
+everything above the syscalls, with permissive provenance:
 
 ```
-MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test
+MIRIFLAGS=-Zmiri-permissive-provenance cargo +nightly miri test --lib --test cross --test model
+MIRIFLAGS='-Zmiri-permissive-provenance -Zmiri-tree-borrows' cargo +nightly miri test --test global
 ```
 
 `tests/model.rs` runs random allocate, free, grow and shrink sequences across
@@ -462,8 +575,10 @@ byte accounting returns to zero.
      atomic per batch), with group and carrier messages; exited threads' heaps
      parked in a pool and adopted, warm ones first; `ShardAlloc` is
      `Send + Sync`; the handshake checked with Loom.
-4. **Phase 4:** `GlobalAlloc` over `ShardAlloc`: allocation before the
-   thread-local exists, re-entrancy, `fork`.
+4. **Phase 4 (done):** `GlobalAlloc` for `ShardAlloc`, a free without a size,
+   re-entrancy and `fork`; `malloc/`, the C API for `LD_PRELOAD`; a first
+   mimalloc-bench run. Next: the C path's single-thread cost and the threaded
+   stress tests it found.
 
 ## Known limits (phase 1)
 
@@ -473,4 +588,12 @@ byte accounting returns to zero.
   coalesces neighbouring free chunks and does better there.
 - Housekeeping runs from the allocation slow path and `maintain()`; a heap that
   neither allocates nor is maintained keeps its free memory until `trim()`.
-- Linux only for real memory (`mmap`); elsewhere `os.rs` uses the global allocator.
+- Linux only for real memory (`mmap`); elsewhere `os.rs` uses the system allocator.
+- Metadata is found through exposed provenance (see
+  [checking](#unsafe-surface-and-checking)), so Miri runs in permissive mode,
+  not strict. Carving every segment out of one reserved address range would
+  allow `REGION.with_addr(addr)` instead, strict and as cheap; large blocks,
+  which grow with `mremap`, would need a way to stay in the range.
+- The pool's lock is a spin lock with yield; Loom cannot explore spin loops,
+  so under Loom it is Loom's mutex, and the flag itself is checked by a
+  native contention test.

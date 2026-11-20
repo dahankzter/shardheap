@@ -43,7 +43,15 @@
 //!   that made it.
 //!
 //! `LocalHeap` and the arenas are `!Send`; `ShardAlloc` is the way to share
-//! collections between threads. See `DESIGN.md`.
+//! collections between threads. It is also a [`GlobalAlloc`](core::alloc::GlobalAlloc):
+//!
+//! ```
+//! #[global_allocator]
+//! static A: shardheap::ShardAlloc = shardheap::ShardAlloc::new();
+//! # fn main() { let v = vec![1u8; 100]; assert_eq!(v.len(), 100); }
+//! ```
+//!
+//! See `DESIGN.md`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -55,6 +63,7 @@ mod os;
 mod reap;
 mod region;
 mod remote;
+mod segmap;
 mod segment;
 #[cfg(not(loom))]
 mod shard;

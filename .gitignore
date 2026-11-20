@@ -3,3 +3,4 @@
 /target-miri
 /target-bench-aligned
 /target-loom
+/target-malloc
